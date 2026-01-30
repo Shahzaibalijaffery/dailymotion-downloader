@@ -420,6 +420,67 @@ function showDownloadNotification(
 }
 
 /**
+ * Show in-page notification when download is blocked (max 2 downloads or large file >500 segments)
+ * @param {string} message - Message to show (e.g. "Maximum 2 downloads at a time...")
+ * @param {string} reason - 'maxConcurrent' | 'largeFile'
+ */
+function showDownloadBlockedToast(message, reason = "maxConcurrent") {
+  if (window.self !== window.top) return;
+
+  const container = createNotificationContainer();
+  if (!container) return;
+
+  const id = "download-blocked-toast";
+  let el = document.getElementById(id);
+  if (!el) {
+    el = document.createElement("div");
+    el.id = id;
+    el.style.cssText = `
+      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
+      color: white;
+      padding: 16px 20px;
+      border-radius: 12px;
+      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      font-size: 14px;
+      line-height: 1.5;
+      animation: slideInUp 0.3s ease-out;
+      pointer-events: auto;
+      width: 400px;
+      max-width: calc(100vw - 40px);
+      box-sizing: border-box;
+    `;
+    container.appendChild(el);
+  }
+
+  const title =
+    reason === "largeFile"
+      ? "Large file downloading"
+      : "Download limit reached";
+  el.innerHTML = `
+    <div style="display: flex; align-items: flex-start; gap: 12px;">
+      <span style="font-size: 20px;">⏳</span>
+      <div>
+        <div style="font-weight: 600; margin-bottom: 6px;">${title}</div>
+        <div style="font-size: 13px; opacity: 0.95;">${message}</div>
+      </div>
+    </div>
+  `;
+  el.style.display = "block";
+  el.style.animation = "none";
+  el.offsetHeight;
+  el.style.animation = "slideInUp 0.3s ease-out";
+
+  const hide = () => {
+    el.style.animation = "slideOutDown 0.3s ease-out forwards";
+    setTimeout(() => {
+      el.style.display = "none";
+    }, 300);
+  };
+  setTimeout(hide, 6000);
+}
+
+/**
  * Update download notification
  * @param {string} downloadId - Download ID
  * @param {string} filename - Filename
@@ -651,9 +712,17 @@ function hideDownloadNotification(downloadId) {
  * @param {string} downloadId - Download ID
  * @param {string} filename - Filename
  */
+const MAX_CONCURRENT_POLLING_DOWNLOADS = 12;
+
 function startDownloadProgressPolling(downloadId, filename) {
   // Don't start if already polling for this download
   if (activeDownloads.has(downloadId)) return;
+
+  // Cap number of simultaneous polling intervals to prevent memory/CPU leak
+  if (activeDownloads.size >= MAX_CONCURRENT_POLLING_DOWNLOADS) {
+    const firstKey = activeDownloads.keys().next().value;
+    if (firstKey) stopDownloadProgressPolling(firstKey);
+  }
 
   // Check if extension context is valid before starting
   if (!isExtensionContextValid()) {

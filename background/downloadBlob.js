@@ -4,6 +4,27 @@
  */
 
 /**
+ * Sanitize filename for chrome.downloads.download (avoids "Invalid filename" from emoji, : * ? " < > | etc.)
+ * @param {string} filename
+ * @returns {string}
+ */
+function sanitizeFilenameForDownload(filename) {
+  if (!filename || typeof filename !== "string") return "dailymotion_video.mp4";
+  const invalid = /[\\/:*?"<>|\u0000-\u001F]/g;
+  const lastDot = filename.lastIndexOf(".");
+  const ext = lastDot > 0 ? filename.slice(lastDot) : "";
+  let base = lastDot > 0 ? filename.slice(0, lastDot) : filename;
+  base = base.replace(invalid, " ");
+  base = base.replace(/[^\x20-\x7E]/g, " ");
+  base = base.replace(/\s+/g, " ").trim();
+  base = base.replace(/^[.\s]+|[.\s]+$/g, "");
+  if (!base) base = "dailymotion_video";
+  const extSafe = /\.(mp4|ts|mkv|webm|mpegts)$/i.test(ext) ? ext : ".mp4";
+  const sanitized = base + extSafe;
+  return sanitized.length > 200 ? base.slice(0, 200 - extSafe.length) + extSafe : sanitized;
+}
+
+/**
  * Download a blob (merged video file) to user's computer
  * @param {Blob} blob - The blob to download
  * @param {string} filename - The filename for the download
@@ -16,15 +37,18 @@
  * @returns {Promise<void>}
  */
 async function downloadBlob(blob, filename, downloadId, downloadControllers, activeChromeDownloads, cleanupIndexedDBBlob, setupOffscreenDocument, blobToDataUrl) {
-  console.log('[downloadBlob] Called with filename:', filename, 'downloadId:', downloadId, 'blobSize:', blob.size);
-  const blobSize = blob.size;
+  filename = sanitizeFilenameForDownload(filename);
+  const isBlobIdRef = typeof blob === "object" && blob !== null && "blobId" in blob;
+  const isBlobUrlRef = typeof blob === "object" && blob !== null && "blobUrl" in blob;
+  const blobId = isBlobIdRef ? blob.blobId : null;
+  const blobSize = isBlobIdRef ? 0 : (blob && blob.size);
+  console.log('[downloadBlob] Called with filename:', filename, 'downloadId:', downloadId, isBlobIdRef ? 'blobId:' + blobId : isBlobUrlRef ? 'blobUrl (SW)' : 'blobSize:' + blobSize);
   
   // Check if download already exists for this downloadId
   if (downloadId) {
     for (const [chromeId, info] of activeChromeDownloads.entries()) {
       if (info.downloadId === downloadId) {
         console.log('[downloadBlob] Download already exists for downloadId, monitoring:', chromeId);
-        // Download already in progress for this downloadId, just wait for it
         return new Promise((resolve, reject) => {
           const checkComplete = () => {
             chrome.downloads.search({ id: chromeId }, (results) => {
@@ -49,86 +73,87 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
   
   try {
     console.log('[downloadBlob] Starting blob download process');
-    // Convert blob to ArrayBuffer
-    const arrayBuffer = await blob.arrayBuffer();
-    if (arrayBuffer.byteLength === 0) {
-      throw new Error('Blob is empty (0 bytes)');
+    let resolvedBlobId = isBlobIdRef ? blob.blobId : isBlobUrlRef ? null : null;
+    if (!isBlobIdRef && !isBlobUrlRef) {
+      // Convert blob to ArrayBuffer and store in IndexedDB (skip for blobUrl - URL is already in SW)
+      let arrayBuffer = await blob.arrayBuffer();
+      if (arrayBuffer.byteLength === 0) {
+        throw new Error('Blob is empty (0 bytes)');
+      }
+      resolvedBlobId = `download_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const db = await new Promise((resolve, reject) => {
+        const request = indexedDB.open('DailymotionDownloaderDB', 1);
+        request.onerror = () => reject(request.error);
+        request.onsuccess = () => resolve(request.result);
+        request.onupgradeneeded = (event) => {
+          const db = event.target.result;
+          if (!db.objectStoreNames.contains('blobs')) {
+            db.createObjectStore('blobs');
+          }
+        };
+      });
+      const transaction = db.transaction(['blobs'], 'readwrite');
+      const store = transaction.objectStore('blobs');
+      await new Promise((resolve, reject) => {
+        const request = store.put(arrayBuffer, resolvedBlobId);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+      await new Promise(resolve => {
+        transaction.oncomplete = () => resolve();
+        transaction.onerror = () => resolve();
+        setTimeout(() => resolve(), 5000);
+      });
+      db.close();
+      arrayBuffer = null;
     }
     
-    // Store in IndexedDB
-    const blobId = `download_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-    const db = await new Promise((resolve, reject) => {
-      const request = indexedDB.open('DailymotionDownloaderDB', 1);
-      request.onerror = () => reject(request.error);
-      request.onsuccess = () => resolve(request.result);
-      request.onupgradeneeded = (event) => {
-        const db = event.target.result;
-        if (!db.objectStoreNames.contains('blobs')) {
-          db.createObjectStore('blobs');
+    // When caller provides a blob URL (e.g. SW-created URL for .ts fallback), skip offscreen
+    if (!isBlobUrlRef) {
+      await setupOffscreenDocument();
+      let offscreenReady = false;
+      const offscreenReadyListener = (request) => {
+        if (request.action === 'offscreenReady') {
+          offscreenReady = true;
+          return true;
         }
       };
-    });
-    
-    const transaction = db.transaction(['blobs'], 'readwrite');
-    const store = transaction.objectStore('blobs');
-    await new Promise((resolve, reject) => {
-      const request = store.put(arrayBuffer, blobId);
-      request.onsuccess = () => resolve();
-      request.onerror = () => reject(request.error);
-    });
-    
-    await new Promise(resolve => {
-      transaction.oncomplete = () => resolve();
-      transaction.onerror = () => resolve();
-      setTimeout(() => resolve(), 5000);
-    });
-    db.close();
-    
-    // Setup offscreen document
-    await setupOffscreenDocument();
-    
-    // Wait for offscreen document to be ready (simplified ping)
-    let offscreenReady = false;
-    const offscreenReadyListener = (request) => {
-      if (request.action === 'offscreenReady') {
-        offscreenReady = true;
-        return true;
-      }
-    };
-    chrome.runtime.onMessage.addListener(offscreenReadyListener);
-    
-    await new Promise(resolve => setTimeout(resolve, 1000));
-    
-    for (let i = 0; i < 5 && !offscreenReady; i++) {
-      if (i > 0) await new Promise(resolve => setTimeout(resolve, 300));
-      try {
-        await new Promise((pingResolve) => {
-          const timeout = setTimeout(pingResolve, 1000);
-          chrome.runtime.sendMessage({ action: 'ping' }, (response) => {
-            clearTimeout(timeout);
-            if (!chrome.runtime.lastError && (response?.ready || response?.success)) {
-              offscreenReady = true;
-            }
-            pingResolve();
+      chrome.runtime.onMessage.addListener(offscreenReadyListener);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      for (let i = 0; i < 5 && !offscreenReady; i++) {
+        if (i > 0) await new Promise(resolve => setTimeout(resolve, 300));
+        try {
+          await new Promise((pingResolve) => {
+            const timeout = setTimeout(pingResolve, 1000);
+            chrome.runtime.sendMessage({ action: 'ping' }, (response) => {
+              clearTimeout(timeout);
+              if (!chrome.runtime.lastError && (response?.ready || response?.success)) {
+                offscreenReady = true;
+              }
+              pingResolve();
+            });
           });
-        });
-      } catch (e) {}
+        } catch (e) {}
+      }
+      chrome.runtime.onMessage.removeListener(offscreenReadyListener);
     }
-    chrome.runtime.onMessage.removeListener(offscreenReadyListener);
+    
+    // Copy values so Promise closure does NOT hold reference to blob (allows GC)
+    const mimeType = isBlobIdRef ? "video/mp4" : (blob.type || "video/mp4");
     
     return new Promise((resolve, reject) => {
-      const messageTimeout = setTimeout(() => {
-        cleanupIndexedDBBlob(blobId);
+      const messageTimeout = isBlobUrlRef ? null : setTimeout(() => {
+        if (resolvedBlobId) cleanupIndexedDBBlob(resolvedBlobId);
         reject(new Error('Offscreen document timeout'));
       }, 10000);
-      
+      let responseHandled = false;
       const sendMessage = (retryCount = 0) => {
         chrome.runtime.sendMessage({
           action: 'downloadBlobFromIndexedDB',
-          blobId: blobId,
+          blobId: resolvedBlobId,
           filename: filename,
-          mimeType: blob.type || 'video/mp4',
-          expectedSize: blobSize
+          mimeType: mimeType,
+          expectedSize: isBlobIdRef ? undefined : blobSize
         }, (response) => {
           if (chrome.runtime.lastError) {
             const errorMsg = chrome.runtime.lastError.message;
@@ -138,34 +163,63 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
               setTimeout(() => sendMessage(retryCount + 1), 2000);
               return;
             }
-            clearTimeout(messageTimeout);
-            cleanupIndexedDBBlob(blobId);
-            reject(new Error(`Offscreen document error: ${errorMsg}`));
+            if (!responseHandled) {
+              responseHandled = true;
+              clearTimeout(messageTimeout);
+              if (response?.blobUrl) {
+                try { chrome.runtime.sendMessage({ action: 'revokeBlobUrl', blobUrl: response.blobUrl }, () => {}); } catch (e) {}
+              }
+              cleanupIndexedDBBlob(resolvedBlobId);
+              reject(new Error(`Offscreen document error: ${errorMsg}`));
+            }
             return;
           }
-          
-          clearTimeout(messageTimeout);
-          
+          if (responseHandled) return;
           if (!response?.success || !response?.blobUrl) {
             console.error('[downloadBlob] Invalid response from offscreen:', response);
-            cleanupIndexedDBBlob(blobId);
+            if (response?.blobUrl) {
+              try { chrome.runtime.sendMessage({ action: 'revokeBlobUrl', blobUrl: response.blobUrl }, () => {}); } catch (e) {}
+            }
+            if (resolvedBlobId) cleanupIndexedDBBlob(resolvedBlobId);
+            responseHandled = true;
+            clearTimeout(messageTimeout);
             reject(new Error(response?.error || 'Invalid response from offscreen document'));
             return;
           }
-          
+          responseHandled = true;
+          clearTimeout(messageTimeout);
           console.log('[downloadBlob] Received blobUrl from offscreen, calling handleBlobUrlResponse');
-          handleBlobUrlResponse(response.blobUrl);
+          handleBlobUrlResponse(response.blobUrl, false);
         });
       };
       
-      function handleBlobUrlResponse(blobUrl) {
-        console.log('[downloadBlob] handleBlobUrlResponse called with blobUrl:', blobUrl?.substring(0, 50) + '...');
+      if (isBlobUrlRef) {
+        handleBlobUrlResponse(blob.blobUrl, true);
+        return;
+      }
+      sendMessage();
+      return;
+      
+      function handleBlobUrlResponse(blobUrl, revokeInSW) {
+        console.log('[downloadBlob] handleBlobUrlResponse called with blobUrl:', blobUrl?.substring(0, 50) + '...', 'revokeInSW:', revokeInSW);
         let downloadStarted = false;
         let isResolved = false;
         let hasRetried = false;
         let currentChromeDownloadId = null;
         let verificationInterval = null;
-        
+        const revokeBlobUrlInOffscreen = () => {
+          if (!blobUrl) return;
+          try {
+            if (revokeInSW) URL.revokeObjectURL(blobUrl);
+            else chrome.runtime.sendMessage({ action: 'revokeBlobUrl', blobUrl }, () => {});
+          } catch (e) {}
+        };
+        // Log when we release refs so you can verify no Blob/closure/Map holds the file after download
+        const logBlobRefsReleased = (reason) => {
+          const stillHasEntry = downloadId && [...activeChromeDownloads.entries()].some(([, info]) => info.downloadId === downloadId);
+          console.log("[MEMORY] Blob refs released:", reason, "downloadId:", downloadId, "| activeChromeDownloads has this id:", !!stillHasEntry, "| map size:", activeChromeDownloads.size);
+        };
+
         const attemptDownload = (useSaveAs) => {
           console.log('[downloadBlob] attemptDownload called, useSaveAs:', useSaveAs, 'downloadStarted:', downloadStarted);
           // Prevent multiple downloads
@@ -177,7 +231,9 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
           const controllerInfo = downloadControllers.get(downloadId);
           if (controllerInfo?.controller.signal.aborted) {
             console.log('[downloadBlob] Download cancelled (controller aborted)');
-            cleanupIndexedDBBlob(blobId);
+            revokeBlobUrlInOffscreen();
+            cleanupIndexedDBBlob(resolvedBlobId);
+            logBlobRefsReleased("cancelled (controller)");
             reject(new Error('Download cancelled'));
             return;
           }
@@ -185,7 +241,9 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
           chrome.storage.local.get([`downloadCancelled_${downloadId}`], (items) => {
             if (items[`downloadCancelled_${downloadId}`]) {
               console.log('[downloadBlob] Download cancelled (storage flag)');
-              cleanupIndexedDBBlob(blobId);
+              revokeBlobUrlInOffscreen();
+              cleanupIndexedDBBlob(resolvedBlobId);
+              logBlobRefsReleased("cancelled (storage)");
               reject(new Error('Download cancelled'));
               return;
             }
@@ -201,13 +259,15 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                     chrome.downloads.search({ id: existingChromeId }, (results) => {
                       if (results && results.length > 0) {
                         if (results[0].state === 'complete') {
-                          cleanupIndexedDBBlob(blobId);
+                          revokeBlobUrlInOffscreen();
+                          cleanupIndexedDBBlob(resolvedBlobId);
                           if (!isResolved) {
                             isResolved = true;
                             resolve();
                           }
                         } else if (results[0].state === 'interrupted') {
-                          cleanupIndexedDBBlob(blobId);
+                          revokeBlobUrlInOffscreen();
+                          cleanupIndexedDBBlob(resolvedBlobId);
                           if (!isResolved) {
                             isResolved = true;
                             reject(new Error(`Download interrupted: ${results[0].error || 'Unknown error'}`));
@@ -246,7 +306,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                   hasRetried = true;
                   setTimeout(() => attemptDownload(false), 500);
                 } else {
-                  cleanupIndexedDBBlob(blobId);
+                  revokeBlobUrlInOffscreen();
+                  cleanupIndexedDBBlob(resolvedBlobId);
                   reject(new Error(errorMsg));
                 }
                 return;
@@ -264,7 +325,7 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
               activeChromeDownloads.set(chromeDownloadId, {
                 downloadId: downloadId,
                 blobUrl: blobUrl,
-                blobId: blobId,
+                blobId: resolvedBlobId,
                 filename: filename
               });
               
@@ -311,7 +372,9 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                     if (!isResolved) {
                       isResolved = true;
                       activeChromeDownloads.delete(chromeDownloadId);
-                      cleanupIndexedDBBlob(blobId);
+                      revokeBlobUrlInOffscreen();
+                      cleanupIndexedDBBlob(resolvedBlobId);
+                      logBlobRefsReleased("complete (instant)");
                       console.log('[downloadBlob] Download completed instantly, resolving');
                       resolve();
                       return;
@@ -321,7 +384,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                     if (!isResolved) {
                       isResolved = true;
                       activeChromeDownloads.delete(chromeDownloadId);
-                      cleanupIndexedDBBlob(blobId);
+                      revokeBlobUrlInOffscreen();
+                      cleanupIndexedDBBlob(resolvedBlobId);
                       console.error('[downloadBlob] Download interrupted instantly:', immediateResults[0].error);
                       reject(new Error(`Download interrupted: ${immediateResults[0].error || 'Unknown error'}`));
                       return;
@@ -347,7 +411,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                     console.log('[downloadBlob] verifyDownload: download not found');
                     if (verificationInterval) clearInterval(verificationInterval);
                     activeChromeDownloads.delete(chromeDownloadId);
-                    cleanupIndexedDBBlob(blobId);
+                    revokeBlobUrlInOffscreen();
+                    cleanupIndexedDBBlob(resolvedBlobId);
                     if (!isResolved) {
                       isResolved = true;
                       reject(new Error('Download not found'));
@@ -371,7 +436,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                       downloadStarted = false;
                       chrome.downloads.removeFile(chromeDownloadId, () => attemptDownload(false));
                     } else {
-                      cleanupIndexedDBBlob(blobId);
+                      revokeBlobUrlInOffscreen();
+                      cleanupIndexedDBBlob(resolvedBlobId);
                       if (!isResolved) {
                         isResolved = true;
                         reject(new Error(`Download interrupted: ${download.error || 'Unknown error'}`));
@@ -382,7 +448,9 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                     if (stuckTimeout) clearTimeout(stuckTimeout);
                     if (verificationInterval) clearInterval(verificationInterval);
                     activeChromeDownloads.delete(chromeDownloadId);
-                    cleanupIndexedDBBlob(blobId);
+                    revokeBlobUrlInOffscreen();
+                    cleanupIndexedDBBlob(resolvedBlobId);
+                    logBlobRefsReleased("complete (verifyDownload)");
                     if (!isResolved) {
                       isResolved = true;
                       resolve();
@@ -421,7 +489,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                             if (state === 'complete') {
                               if (verificationInterval) clearInterval(verificationInterval);
                               activeChromeDownloads.delete(chromeDownloadId);
-                              cleanupIndexedDBBlob(blobId);
+                              revokeBlobUrlInOffscreen();
+                              cleanupIndexedDBBlob(resolvedBlobId);
                               if (!isResolved) {
                                 isResolved = true;
                                 resolve();
@@ -432,7 +501,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                                 if (chrome.runtime.lastError?.message?.includes('must be complete')) {
                                   if (verificationInterval) clearInterval(verificationInterval);
                                   activeChromeDownloads.delete(chromeDownloadId);
-                                  cleanupIndexedDBBlob(blobId);
+                                  revokeBlobUrlInOffscreen();
+                                  cleanupIndexedDBBlob(resolvedBlobId);
                                   if (!isResolved) {
                                     isResolved = true;
                                     resolve();
@@ -445,7 +515,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                             } else {
                               if (verificationInterval) clearInterval(verificationInterval);
                               activeChromeDownloads.delete(chromeDownloadId);
-                              cleanupIndexedDBBlob(blobId);
+                              revokeBlobUrlInOffscreen();
+                              cleanupIndexedDBBlob(resolvedBlobId);
                               if (!isResolved) {
                                 isResolved = true;
                                 resolve();
@@ -490,7 +561,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
               setTimeout(() => {
                 chrome.downloads.search({ id: chromeDownloadId }, (results) => {
                   if (!results || results.length === 0 || results[0].state === 'complete' || results[0].state === 'interrupted') {
-                    cleanupIndexedDBBlob(blobId);
+                    revokeBlobUrlInOffscreen();
+                    cleanupIndexedDBBlob(resolvedBlobId);
                   }
                 });
               }, 600000);
@@ -504,7 +576,8 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
       sendMessage();
     });
   } catch (error) {
-    // Fallback: data URL for small files only
+    // Fallback: data URL for small files only (not when downloading by blobId)
+    if (isBlobIdRef) throw error;
     if (blobSize <= 50 * 1024 * 1024) {
       const dataUrl = await blobToDataUrl(blob);
       return new Promise((resolve, reject) => {
@@ -606,7 +679,7 @@ async function downloadFullVideoFile(
     }
 
     // Combine all chunks
-    const allChunks = new Uint8Array(receivedLength);
+    let allChunks = new Uint8Array(receivedLength);
     let position = 0;
     for (const chunk of chunks) {
       allChunks.set(chunk, position);
@@ -636,6 +709,10 @@ async function downloadFullVideoFile(
       setupOffscreenDocument,
       blobToDataUrl,
     );
+
+    // Release large buffers so GC can reclaim RAM
+    chunks.length = 0;
+    allChunks = null;
 
     // Clean up ALL download-related storage keys after delay
     // Keep progress/status visible for 15s so polling can detect completion, then remove everything

@@ -471,6 +471,9 @@ async function downloadAndMergeM3U8(m3u8Url, filename, downloadId, abortControll
     
     console.log(`Found ${segments.length} segments${initSegmentUrl ? ' and init segment' : ''}, downloading...`);
     
+    // Store segment count so background can block new downloads when any active has > 500 segments
+    await chrome.storage.local.set({ [`downloadSegments_${downloadId}`]: segments.length });
+    
     // Download init segment (map URL) if available
     // This is CRITICAL for fMP4 playback - contains container metadata (moov atom)
     // QuickTime REQUIRES the init segment with ftyp box for playback
@@ -1201,7 +1204,7 @@ async function downloadAndMergeM3U8(m3u8Url, filename, downloadId, abortControll
     }
     
     // Validate file structure
-    const mergedArray = new Uint8Array(await mergedBlob.arrayBuffer());
+    let mergedArray = new Uint8Array(await mergedBlob.arrayBuffer());
     if (mergedArray.length < 8) {
       throw new Error('Merged video file is too small. Download failed.');
     }
@@ -1242,6 +1245,8 @@ async function downloadAndMergeM3U8(m3u8Url, filename, downloadId, abortControll
       // Recreate blob from validated array
       validatedBlob = new Blob([mergedArray], { type: 'video/mp4' });
     }
+    // Release large buffer so GC can free it before downloadBlob completes
+    mergedArray = null;
     
     const sizeMB = Math.round(validatedBlob.size / (1024 * 1024));
     console.log(`Total merged size: ${sizeMB}MB`);
@@ -1261,7 +1266,16 @@ async function downloadAndMergeM3U8(m3u8Url, filename, downloadId, abortControll
     });
     
     await downloadBlob(validatedBlob, finalFilename, downloadId, downloadControllers, activeChromeDownloads, cleanupIndexedDBBlob, setupOffscreenDocument, blobToDataUrl);
-    
+
+    // Release large buffers so GC can reclaim RAM (merge phase holds 2–3x video size)
+    segmentData.length = 0;
+    if (orderedSegments && orderedSegments.length) orderedSegments.length = 0;
+    if (segmentBuffers && segmentBuffers.length) segmentBuffers.length = 0;
+    segmentBlobs.length = 0;
+    finalBlobs.length = 0;
+    mergedBlob = null;
+    validatedBlob = null;
+
     // Clean up ALL download-related storage keys after delay
     // Keep progress/status visible for 15s so polling can detect completion, then remove everything
     setTimeout(() => {
@@ -1270,6 +1284,7 @@ async function downloadAndMergeM3U8(m3u8Url, filename, downloadId, abortControll
         `downloadStatus_${downloadId}`,
         `downloadInfo_${downloadId}`,
         `downloadCancelled_${downloadId}`,
+        `downloadSegments_${downloadId}`,
         `blobReady_${downloadId}` // Also clean up blob ready flag if it exists
       ], () => {
         if (chrome.runtime.lastError) {
@@ -1296,6 +1311,7 @@ async function downloadAndMergeM3U8(m3u8Url, filename, downloadId, abortControll
           `downloadStatus_${downloadId}`,
           `downloadInfo_${downloadId}`,
           `downloadCancelled_${downloadId}`,
+          `downloadSegments_${downloadId}`,
           `blobReady_${downloadId}` // Also clean up blob ready flag if it exists
         ], () => {
           if (chrome.runtime.lastError) {
@@ -1341,6 +1357,7 @@ async function downloadAndMergeM3U8(m3u8Url, filename, downloadId, abortControll
         `downloadStatus_${downloadId}`,
         `downloadInfo_${downloadId}`,
         `downloadCancelled_${downloadId}`,
+        `downloadSegments_${downloadId}`,
         `blobReady_${downloadId}` // Also clean up blob ready flag if it exists
       ], () => {
         if (chrome.runtime.lastError) {

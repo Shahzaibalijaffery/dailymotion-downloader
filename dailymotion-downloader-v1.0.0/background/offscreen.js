@@ -23,6 +23,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
     
+    if (request.action === "revokeBlobUrl" && request.blobUrl) {
+      try {
+        URL.revokeObjectURL(request.blobUrl);
+        console.log("Revoked blob URL to free RAM");
+      } catch (e) {
+        console.warn("revokeBlobUrl failed:", e);
+      }
+      sendResponse({ success: true });
+      return true;
+    }
+
     if (request.action === "downloadBlobFromIndexedDB") {
       console.log("Processing downloadBlobFromIndexedDB request:", {
         blobId: request.blobId,
@@ -100,7 +111,7 @@ async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
     const transaction = db.transaction(["blobs"], "readonly");
     const store = transaction.objectStore("blobs");
 
-    const arrayBuffer = await new Promise((resolve, reject) => {
+    let arrayBuffer = await new Promise((resolve, reject) => {
       const request = store.get(blobId);
       request.onsuccess = () => {
         const data = request.result;
@@ -129,9 +140,10 @@ async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
       );
     }
 
-    // Create blob and blob URL
+    // Create blob and blob URL (Blob holds the data; we drop local ref so only blobUrl keeps it alive until revoke)
     const blob = new Blob([arrayBuffer], { type: mimeType || "video/mp4" });
     const blobUrl = URL.createObjectURL(blob);
+    arrayBuffer = null; // No closure/global ref: only blob (via URL) holds data until revokeBlobUrl
 
     console.log(`Created blob URL: ${blobUrl.substring(0, 50)}...`);
 

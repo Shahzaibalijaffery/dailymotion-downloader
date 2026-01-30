@@ -3,8 +3,10 @@
  * Handles extracting video URLs from page, config files, and intercepting network requests
  */
 
-// Track URLs we've already sent to avoid spamming background
+// Track URLs we've already sent to avoid spamming background (capped to prevent memory leak)
 const seenUrls = new Set();
+const SEEN_URLS_MAX = 400;
+let lastSeenVideoId = null;
 
 // Debug logging toggle for extraction module
 // When false (default), we avoid heavy console.log spam that can lag the page
@@ -207,10 +209,19 @@ function sendUrlToBackground(url, type) {
     return; // Not a video page, skip URL detection
   }
   
-  seenUrls.add(url);
-  
-  // Get video ID from page URL (current page)
+  // Clear seenUrls when user navigates to a different video to free memory
   const currentPageVideoId = getVideoIdFromPage();
+  if (currentPageVideoId !== lastSeenVideoId) {
+    lastSeenVideoId = currentPageVideoId;
+    seenUrls.clear();
+  }
+  seenUrls.add(url);
+  // Cap seenUrls to prevent unbounded memory growth
+  if (seenUrls.size > SEEN_URLS_MAX) {
+    const arr = [...seenUrls];
+    seenUrls.clear();
+    arr.slice(-Math.floor(SEEN_URLS_MAX / 2)).forEach((u) => seenUrls.add(u));
+  }
   
   // Try to extract videoId from the URL itself (might be different from current page)
   const urlVideoId = extractVideoId(url);
@@ -301,6 +312,14 @@ function setupNetworkInterception() {
     }
     return originalFetch.apply(this, args);
   };
+}
+
+/**
+ * Clear seen-URLs cache (call when leaving video page to free memory)
+ */
+function clearSeenUrls() {
+  seenUrls.clear();
+  lastSeenVideoId = null;
 }
 
 /**

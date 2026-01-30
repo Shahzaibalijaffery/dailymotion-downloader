@@ -22,7 +22,8 @@ let messageListener = null;
 let downloadsListener = null;
 
 // Track active Chrome downloads to monitor their state
-const activeChromeDownloads = new Map(); // Map of chromeDownloadId -> { downloadId, blobUrl, blobId }
+// Only primitives/strings here (downloadId, blobUrl string, blobId, filename) — no Blob/ArrayBuffer
+const activeChromeDownloads = new Map(); // Map of chromeDownloadId -> { downloadId, blobUrl, blobId, filename }
 
 // Function to clean up all resources
 function cleanupAllResources() {
@@ -61,6 +62,9 @@ function cleanupAllResources() {
     processedConfigs.clear();
     parsingHLSVariants.clear();
     videoData = {};
+    if (typeof pendingFileSizes !== 'undefined' && pendingFileSizes && pendingFileSizes.clear) {
+      pendingFileSizes.clear();
+    }
     
     console.log("Cleanup complete");
   } catch (e) {
@@ -83,15 +87,80 @@ if (chrome.runtime.onSuspend) {
 // We can detect this by checking if we can still access chrome.runtime
 let removalCheckInterval = null;
 
-// Periodically check if extension is being removed (only when no active operations)
+// Periodically prune memory and storage to prevent throttle/freeze
+let _cleanupTick = 0;
 function checkForRemoval() {
-  // Only check if there are no active downloads to avoid interfering with normal operation
+  _cleanupTick += 1;
+  
+  // 1) Prune pendingFileSizes
+  if (pendingFileSizes.size > 250) {
+    const keysToDelete = [...pendingFileSizes.keys()].slice(0, 150);
+    keysToDelete.forEach((k) => pendingFileSizes.delete(k));
+  }
+  
+  // 2) Prune videoData for closed tabs (avoid unbounded growth)
+  chrome.tabs.query({}, (tabs) => {
+    if (chrome.runtime.lastError) return;
+    const existingTabIds = new Set((tabs || []).map((t) => t.id));
+    Object.keys(videoData).forEach((tabIdStr) => {
+      const tabId = parseInt(tabIdStr, 10);
+      if (!existingTabIds.has(tabId)) {
+        delete videoData[tabId];
+      }
+    });
+  });
+  
+  // 3) Cap in-memory Sets to prevent unbounded growth
+  if (processedConfigs.size > 100) {
+    const arr = [...processedConfigs];
+    arr.slice(0, 50).forEach((x) => processedConfigs.delete(x));
+  }
+  if (parsingHLSVariants.size > 20) {
+    const arr = [...parsingHLSVariants];
+    arr.slice(0, 10).forEach((x) => parsingHLSVariants.delete(x));
+  }
+  
+  // 4) Every 3rd tick: clean stale activeDownloadIds and orphan storage keys
+  if (_cleanupTick % 3 === 0) {
+    chrome.storage.local.get(['activeDownloadIds'], (r) => {
+      const activeIds = r.activeDownloadIds || [];
+      if (activeIds.length === 0) return;
+      const keysToCheck = activeIds.flatMap((id) => [
+        `downloadProgress_${id}`,
+        `downloadStatus_${id}`,
+      ]);
+      chrome.storage.local.get(keysToCheck, (progressResult) => {
+        if (!progressResult) progressResult = {};
+        const stillActive = activeIds.filter((id) => {
+          const progress = progressResult[`downloadProgress_${id}`];
+          const status = (progressResult[`downloadStatus_${id}`] || '').toLowerCase();
+          if (progress === undefined) return false;
+          if (progress === 100) return false;
+          if (status.includes('complete') || status.includes('cancelled') || status.includes('failed')) return false;
+          return true;
+        });
+        const staleIds = activeIds.filter((id) => !stillActive.includes(id));
+        chrome.storage.local.set({ activeDownloadIds: stillActive }, () => {
+          // Remove orphan storage keys for stale download IDs
+          staleIds.forEach((id) => {
+            chrome.storage.local.remove([
+              `downloadProgress_${id}`,
+              `downloadStatus_${id}`,
+              `downloadInfo_${id}`,
+              `downloadCancelled_${id}`,
+              `blobReady_${id}`,
+            ]);
+          });
+        });
+      });
+    });
+  }
+  
+  // 5) Check extension removal
   if (downloadControllers.size === 0 && activeDownloads.size === 0) {
     try {
-      // Try to access runtime - if this throws, extension might be removed
       chrome.runtime.id;
     } catch (e) {
-      // Extension context invalidated - clean up
       if (e.message && e.message.includes("Extension context invalidated")) {
         cleanupAllResources();
         if (removalCheckInterval) {
@@ -297,8 +366,15 @@ if (!downloadsListener) {
           clearTimeout(downloadInfo.cleanupTimer);
         }
         
+        // Revoke blob URL in offscreen so GC can free RAM (no global/closure ref to Blob)
+        if (downloadInfo.blobUrl) {
+          try {
+            chrome.runtime.sendMessage({ action: 'revokeBlobUrl', blobUrl: downloadInfo.blobUrl }, () => {});
+          } catch (e) {}
+        }
         activeChromeDownloads.delete(chromeDownloadId);
         cleanupIndexedDBBlob(downloadInfo.blobId);
+        console.log("[MEMORY] Released blob references (revoked URL, cleaned IDB) for downloadId:", downloadInfo.downloadId);
       } else if (
         downloadDelta.state &&
         downloadDelta.state.current === "interrupted"
@@ -339,8 +415,15 @@ if (!downloadsListener) {
           clearTimeout(downloadInfo.cleanupTimer);
         }
         
+        // Revoke blob URL in offscreen so GC can free RAM
+        if (downloadInfo.blobUrl) {
+          try {
+            chrome.runtime.sendMessage({ action: 'revokeBlobUrl', blobUrl: downloadInfo.blobUrl }, () => {});
+          } catch (e) {}
+        }
         activeChromeDownloads.delete(chromeDownloadId);
         cleanupIndexedDBBlob(downloadInfo.blobId);
+        console.log("[MEMORY] Released blob references (interrupted, revoked URL, cleaned IDB) for downloadId:", downloadInfo.downloadId);
       } else if (
         downloadDelta.state &&
         downloadDelta.state.current === "in_progress"
@@ -399,6 +482,11 @@ chrome.webRequest.onHeadersReceived.addListener(
           } else if (tabId && tabId > 0) {
             // Tab data doesn't exist yet, store size temporarily
             pendingFileSizes.set(url, fileSize);
+            // Cap pendingFileSizes to prevent unbounded memory growth
+            if (pendingFileSizes.size > 300) {
+              const keysToDelete = [...pendingFileSizes.keys()].slice(0, 100);
+              keysToDelete.forEach((k) => pendingFileSizes.delete(k));
+            }
           }
         }
       }
@@ -612,15 +700,39 @@ function storeVideoUrl(
       (videoId && videoData[tabId].videoIds[videoId]?.title) || // Fallback to stored title for this videoId
       null;
     
-    videoData[tabId].urls.push({ 
-      url, 
-      type, 
+    videoData[tabId].urls.push({
+      url,
+      type,
       timestamp: timestamp,
-      fromNetworkRequest: fromNetworkRequest, // Mark if from network request (likely playing)
-      videoTitle: urlVideoTitle, // Store title per URL (never fall back to tab-level)
-      videoId: videoId, // Store video ID for matching
-      fileSize: fileSize, // Store file size in bytes (null if unknown)
+      fromNetworkRequest: fromNetworkRequest,
+      videoTitle: urlVideoTitle,
+      videoId: videoId,
+      fileSize: fileSize,
     });
+    // Cap URLs per tab to prevent unbounded memory growth (keep most recent)
+    const MAX_URLS_PER_TAB = 120;
+    if (videoData[tabId].urls.length > MAX_URLS_PER_TAB) {
+      videoData[tabId].urls = videoData[tabId].urls.slice(-MAX_URLS_PER_TAB);
+      if (videoData[tabId].activeUrl && !videoData[tabId].urls.some((u) => u.url === videoData[tabId].activeUrl)) {
+        videoData[tabId].activeUrl = videoData[tabId].urls[videoData[tabId].urls.length - 1]?.url || null;
+      }
+    }
+    // Cap videoIds per tab: keep only IDs still referenced in urls
+    const videoIdKeys = Object.keys(videoData[tabId].videoIds || {});
+    if (videoIdKeys.length > 30) {
+      const inUse = new Set();
+      videoData[tabId].urls.forEach((u) => {
+        if (u.videoId != null) {
+          inUse.add(u.videoId);
+          inUse.add(String(u.videoId));
+        }
+      });
+      const newVideoIds = {};
+      videoIdKeys.forEach((k) => {
+        if (inUse.has(k)) newVideoIds[k] = videoData[tabId].videoIds[k];
+      });
+      videoData[tabId].videoIds = newVideoIds;
+    }
     console.log("Stored video URL:", {
       tabId,
       url,

@@ -30,10 +30,16 @@ async function cancelDownload(downloadId, downloadControllers, activeChromeDownl
     for (const [chromeDownloadId, chromeDownloadInfo] of activeChromeDownloads.entries()) {
       if (chromeDownloadInfo.downloadId === downloadId) {
         chrome.downloads.cancel(chromeDownloadId, () => {});
+        if (chromeDownloadInfo.blobUrl) {
+          try {
+            chrome.runtime.sendMessage({ action: 'revokeBlobUrl', blobUrl: chromeDownloadInfo.blobUrl }, () => {});
+          } catch (e) {}
+        }
         if (chromeDownloadInfo.blobId) {
           cleanupIndexedDBBlob(chromeDownloadInfo.blobId);
         }
         activeChromeDownloads.delete(chromeDownloadId);
+        console.log("[MEMORY] Released blob references (cancelled, revoked URL, cleaned IDB) for downloadId:", downloadId);
       }
     }
     
@@ -49,6 +55,11 @@ async function cancelDownload(downloadId, downloadControllers, activeChromeDownl
     const info = downloadInfo.get(downloadId);
     const tabId = info?.tabId;
     downloadInfo.delete(downloadId);
+    
+    // Remove from concurrent-download count so user can start another
+    const storage = await chrome.storage.local.get(['activeDownloadIds']);
+    const activeIds = (storage.activeDownloadIds || []).filter((id) => id !== downloadId);
+    await chrome.storage.local.set({ activeDownloadIds: activeIds });
     
     // Remove progress and downloadInfo immediately
     // Keep cancellation flag and status temporarily so download process can detect cancellation

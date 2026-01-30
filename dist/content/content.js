@@ -286,6 +286,17 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
   
+  // Handle download blocked notification (max 2 downloads or large file >500 segments)
+  if (request.action === 'showDownloadBlockedNotification') {
+    const message = request.message || 'Please wait for the current download(s) to complete.';
+    const reason = request.reason || 'maxConcurrent';
+    if (typeof showDownloadBlockedToast === 'function') {
+      showDownloadBlockedToast(message, reason);
+    }
+    sendResponse({ success: true });
+    return true;
+  }
+
   // Handle download cancellation notification
   if (request.action === 'downloadCancelled') {
     console.log('Download cancelled notification received:', request.downloadId);

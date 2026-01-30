@@ -54,7 +54,12 @@ function initializePopup(tab) {
   // Set up navigation detection (detect URL changes while popup is open)
   setupNavigationDetection();
 
-  // Clean up intervals when popup closes (after 2 minutes max)
+  // Clean up when popup is hidden (user switched tab or closed popup) to free memory
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) cleanup();
+  });
+
+  // Fallback: clean up after 2 minutes max
   setTimeout(() => {
     cleanup();
   }, 120000);
@@ -407,7 +412,7 @@ function setupNavigationDetection() {
 }
 
 /**
- * Cleanup intervals
+ * Cleanup intervals and release large refs to avoid memory retention
  */
 function cleanup() {
   if (refreshInterval) {
@@ -422,6 +427,7 @@ function cleanup() {
     clearTimeout(popupRetryTimer);
     popupRetryTimer = null;
   }
+  latestVideoData = null;
 }
 
 // Make loadVideoData available globally for refresh buttons

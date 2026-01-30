@@ -6,8 +6,19 @@
 console.log("========================================");
 console.log("Offscreen document script EXECUTING!");
 console.log("Script location:", window.location.href);
-console.log("Chrome runtime available:", typeof chrome !== 'undefined' && typeof chrome.runtime !== 'undefined');
+console.log(
+  "Chrome runtime available:",
+  typeof chrome !== "undefined" && typeof chrome.runtime !== "undefined",
+);
 console.log("========================================");
+
+// UMD bundle (ffmpeg.min.js) exposes FFmpegWASM.FFmpeg, not global FFmpeg
+const FFmpegClass =
+  typeof FFmpeg !== "undefined"
+    ? FFmpeg
+    : typeof FFmpegWASM !== "undefined" && FFmpegWASM && FFmpegWASM.FFmpeg
+      ? FFmpegWASM.FFmpeg
+      : null;
 
 // Set up message listener immediately (don't wait for DOM)
 // This ensures the listener is ready as soon as possible
@@ -15,22 +26,209 @@ console.log("Setting up chrome.runtime.onMessage listener...");
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   try {
     console.log("Offscreen document received message:", request.action);
-    
+
     if (request.action === "ping") {
       // Respond to ping to verify we're ready
       console.log("Offscreen document responding to ping");
       sendResponse({ success: true, ready: true });
       return true;
     }
-    
+
+    if (request.action === "revokeBlobUrl" && request.blobUrl) {
+      try {
+        URL.revokeObjectURL(request.blobUrl);
+        console.log("Revoked blob URL to free RAM");
+      } catch (e) {
+        console.warn("revokeBlobUrl failed:", e);
+      }
+      sendResponse({ success: true });
+      return true;
+    }
+
+    if (request.action === "checkFFmpeg") {
+      ensureFFmpegReady()
+        .then(() => sendResponse({ success: true }))
+        .catch((err) => {
+          console.warn("checkFFmpeg failed:", err);
+          sendResponse({ success: false, error: err.message });
+        });
+      return true;
+    }
+
+    if (request.action === "buildBlobFromChunksForDownload") {
+      const { blobId, chunkCount } = request;
+      if (!blobId || chunkCount == null) {
+        sendResponse({ success: false, error: "Missing blobId or chunkCount" });
+        return true;
+      }
+      (async () => {
+        try {
+          const db = await new Promise((resolve, reject) => {
+            const req = indexedDB.open("DailymotionDownloaderDB", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+              if (!e.target.result.objectStoreNames.contains("blobs")) {
+                e.target.result.createObjectStore("blobs");
+              }
+            };
+          });
+          const parts = [];
+          for (let i = 0; i < chunkCount; i++) {
+            const chunkKey = `${blobId}_chunk_${i}`;
+            const chunk = await new Promise((resolve, reject) => {
+              const tx = db.transaction(["blobs"], "readonly");
+              const req = tx.objectStore("blobs").get(chunkKey);
+              req.onsuccess = () => resolve(req.result);
+              req.onerror = () => reject(req.error);
+            });
+            if (!chunk || !(chunk instanceof ArrayBuffer)) {
+              throw new Error(`Missing or invalid chunk ${i}`);
+            }
+            parts.push(chunk);
+          }
+          const blob = new Blob(parts, { type: "video/mp2t" });
+          const blobUrl = URL.createObjectURL(blob);
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(["blobs"], "readwrite");
+            const store = tx.objectStore("blobs");
+            for (let i = 0; i < chunkCount; i++) {
+              store.delete(`${blobId}_chunk_${i}`);
+            }
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          sendResponse({ success: true, blobUrl });
+        } catch (err) {
+          console.error("buildBlobFromChunksForDownload failed:", err);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === "assembleChunksForConvert") {
+      const { blobId, chunkCount, totalSize } = request;
+      if (!blobId || chunkCount == null || !totalSize) {
+        sendResponse({ success: false, error: "Missing blobId, chunkCount or totalSize" });
+        return true;
+      }
+      (async () => {
+        try {
+          const db = await new Promise((resolve, reject) => {
+            const req = indexedDB.open("DailymotionDownloaderDB", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+              if (!e.target.result.objectStoreNames.contains("blobs")) {
+                e.target.result.createObjectStore("blobs");
+              }
+            };
+          });
+          const result = new Uint8Array(totalSize);
+          let offset = 0;
+          for (let i = 0; i < chunkCount; i++) {
+            const chunkKey = `${blobId}_chunk_${i}`;
+            const chunk = await new Promise((resolve, reject) => {
+              const tx = db.transaction(["blobs"], "readonly");
+              const req = tx.objectStore("blobs").get(chunkKey);
+              req.onsuccess = () => resolve(req.result);
+              req.onerror = () => reject(req.error);
+            });
+            if (!chunk || !(chunk instanceof ArrayBuffer)) {
+              throw new Error(`Missing or invalid chunk ${i}`);
+            }
+            result.set(new Uint8Array(chunk), offset);
+            offset += chunk.byteLength;
+          }
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(["blobs"], "readwrite");
+            const store = tx.objectStore("blobs");
+            store.put(result.buffer, blobId);
+            for (let i = 0; i < chunkCount; i++) {
+              store.delete(`${blobId}_chunk_${i}`);
+            }
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          sendResponse({ success: true });
+        } catch (err) {
+          console.error("assembleChunksForConvert failed:", err);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === "storeBlobFromUrl") {
+      const { blobUrl, blobId } = request;
+      if (!blobUrl || !blobId) {
+        sendResponse({ success: false, error: "Missing blobUrl or blobId" });
+        return true;
+      }
+      (async () => {
+        try {
+          const res = await fetch(blobUrl);
+          if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+          const arrayBuffer = await res.arrayBuffer();
+          const db = await new Promise((resolve, reject) => {
+            const req = indexedDB.open("DailymotionDownloaderDB", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+              if (!e.target.result.objectStoreNames.contains("blobs")) {
+                e.target.result.createObjectStore("blobs");
+              }
+            };
+          });
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(["blobs"], "readwrite");
+            tx.objectStore("blobs").put(arrayBuffer, blobId);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          sendResponse({ success: true });
+        } catch (err) {
+          console.error("storeBlobFromUrl failed:", err);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === "convertToMp4") {
+      handleConvertToMp4(
+        request.blobId,
+        request.downloadId,
+        (progress) => {
+          try {
+            chrome.runtime.sendMessage({
+              action: "convertProgress",
+              downloadId: request.downloadId,
+              progress,
+            });
+          } catch (e) {}
+        },
+      )
+        .then((result) => sendResponse(result))
+        .catch((err) => {
+          console.error("convertToMp4 error:", err);
+          sendResponse({ success: false, error: err.message });
+        });
+      return true;
+    }
+
     if (request.action === "downloadBlobFromIndexedDB") {
       console.log("Processing downloadBlobFromIndexedDB request:", {
         blobId: request.blobId,
         filename: request.filename,
         mimeType: request.mimeType,
-        expectedSize: request.expectedSize
+        expectedSize: request.expectedSize,
       });
-      
+
       handleBlobDownload(
         request.blobId,
         request.filename,
@@ -48,7 +246,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
       return true; // Keep channel open for async response
     }
-    
+
     console.log("Unknown action:", request.action);
     return false;
   } catch (error) {
@@ -60,12 +258,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 console.log("✅ Message listener set up successfully!");
 
-// Send ready signal to background script
+// Send ready signal to background script (include FFmpeg availability)
+const ffmpegAvailable = FFmpegClass !== null;
 console.log("Sending offscreenReady signal to background script...");
 try {
-  chrome.runtime.sendMessage({ action: 'offscreenReady' }, (response) => {
+  chrome.runtime.sendMessage({ action: "offscreenReady", ffmpegAvailable }, (response) => {
     if (chrome.runtime.lastError) {
-      console.warn("❌ Error sending offscreenReady:", chrome.runtime.lastError.message);
+      console.warn(
+        "❌ Error sending offscreenReady:",
+        chrome.runtime.lastError.message,
+      );
     } else {
       console.log("✅ Offscreen document ready signal sent successfully!");
     }
@@ -76,6 +278,7 @@ try {
 
 console.log("========================================");
 console.log("✅ Offscreen document fully initialized and ready!");
+console.log("FFmpeg (ffmpeg.wasm) available:", FFmpegClass !== null);
 console.log("Message listener is active and waiting for messages");
 console.log("========================================");
 
@@ -100,7 +303,7 @@ async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
     const transaction = db.transaction(["blobs"], "readonly");
     const store = transaction.objectStore("blobs");
 
-    const arrayBuffer = await new Promise((resolve, reject) => {
+    let arrayBuffer = await new Promise((resolve, reject) => {
       const request = store.get(blobId);
       request.onsuccess = () => {
         const data = request.result;
@@ -129,9 +332,10 @@ async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
       );
     }
 
-    // Create blob and blob URL
+    // Create blob and blob URL (Blob holds the data; we drop local ref so only blobUrl keeps it alive until revoke)
     const blob = new Blob([arrayBuffer], { type: mimeType || "video/mp4" });
     const blobUrl = URL.createObjectURL(blob);
+    arrayBuffer = null; // No closure/global ref: only blob (via URL) holds data until revokeBlobUrl
 
     console.log(`Created blob URL: ${blobUrl.substring(0, 50)}...`);
 
@@ -142,4 +346,116 @@ async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
     console.error("Failed to download blob from IndexedDB:", error);
     throw error;
   }
+}
+
+// FFmpeg.wasm: load core from extension files (no blob URLs = no CSP change)
+let ffmpegInstance = null;
+let ffmpegLoadPromise = null;
+
+async function getFFmpeg() {
+  if (!FFmpegClass) {
+    throw new Error("FFmpeg (ffmpeg.wasm) not loaded. Check offscreen script order.");
+  }
+  if (ffmpegInstance) return ffmpegInstance;
+  if (ffmpegLoadPromise) return ffmpegLoadPromise;
+  ffmpegLoadPromise = (async () => {
+    const coreURL = chrome.runtime.getURL("background/ffmpeg-core.js");
+    const wasmURL = chrome.runtime.getURL("background/ffmpeg-core.wasm");
+    const ffmpeg = new FFmpegClass();
+    await ffmpeg.load({ coreURL, wasmURL });
+    ffmpegInstance = ffmpeg;
+    return ffmpeg;
+  })();
+  return ffmpegLoadPromise;
+}
+
+/** Ensure FFmpeg is loaded and ready (used by checkFFmpeg and before convert). */
+async function ensureFFmpegReady() {
+  await getFFmpeg();
+}
+
+async function handleConvertToMp4(blobId, downloadId, onProgress) {
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("DailymotionDownloaderDB", 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (event) => {
+      const d = event.target.result;
+      if (!d.objectStoreNames.contains("blobs")) {
+        d.createObjectStore("blobs");
+      }
+    };
+  });
+
+  const arrayBuffer = await new Promise((resolve, reject) => {
+    const tx = db.transaction(["blobs"], "readonly");
+    const store = tx.objectStore("blobs");
+    const req = store.get(blobId);
+    req.onsuccess = () => {
+      const data = req.result;
+      if (!data || !(data instanceof ArrayBuffer)) {
+        reject(new Error(`Blob not found: ${blobId}`));
+      } else {
+        resolve(data);
+      }
+    };
+    req.onerror = () => reject(req.error || new Error("IDB read error"));
+  });
+  db.close();
+
+  const ffmpeg = await getFFmpeg();
+
+  ffmpeg.on("progress", ({ progress }) => {
+    if (typeof onProgress === "function") {
+      try {
+        onProgress(Math.min(1, Math.max(0, progress)));
+      } catch (e) {}
+    }
+  });
+
+  // Pass a single Uint8Array view so FFmpeg can transfer the buffer to the worker (no copy).
+  // The library uses postMessage(..., [data.buffer]) so the buffer is moved, not copied.
+  const inputData = new Uint8Array(arrayBuffer);
+  await ffmpeg.writeFile("input.ts", inputData);
+  await ffmpeg.exec(["-i", "input.ts", "-c", "copy", "output.mp4"]);
+  const data = await ffmpeg.readFile("output.mp4");
+  try {
+    if (typeof ffmpeg.deleteFile === "function") {
+      await ffmpeg.deleteFile("input.ts");
+      await ffmpeg.deleteFile("output.mp4");
+    }
+  } catch (e) {}
+
+  const outputBuffer =
+    data instanceof Uint8Array
+      ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+      : data;
+  if (!outputBuffer || !(outputBuffer instanceof ArrayBuffer)) {
+    throw new Error("FFmpeg did not produce output");
+  }
+
+  const outputBlobId =
+    "convert_" + Date.now() + "_" + Math.random().toString(36).slice(2, 11);
+  await new Promise((resolve, reject) => {
+    const req = indexedDB.open("DailymotionDownloaderDB", 1);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const database = req.result;
+      const tx = database.transaction(["blobs"], "readwrite");
+      const store = tx.objectStore("blobs");
+      store.put(outputBuffer, outputBlobId);
+      tx.oncomplete = () => {
+        database.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+
+  return {
+    success: true,
+    outputBlobId,
+    extension: "mp4",
+    mimeType: "video/mp4",
+  };
 }

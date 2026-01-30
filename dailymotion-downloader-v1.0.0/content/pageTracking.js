@@ -51,14 +51,32 @@ function getCurrentVideoTitle() {
 }
 
 /**
+ * Stop URL/data intervals when not on video page to reduce CPU and avoid leaks
+ */
+function stopPageTrackingIntervals() {
+  if (urlCheckInterval) {
+    clearInterval(urlCheckInterval);
+    urlCheckInterval = null;
+  }
+  if (dataCheckInterval) {
+    clearInterval(dataCheckInterval);
+    dataCheckInterval = null;
+  }
+  if (typeof clearSeenUrls === 'function') {
+    clearSeenUrls();
+  }
+}
+
+/**
  * Check for URL changes and re-inject button if needed
  */
 function checkUrlChange() {
   const currentUrl = window.location.href;
   
-  // Only run checks if we're on a video page
+  // Stop intervals when not on video page to reduce memory/CPU
   if (!isVideoPage()) {
-    return; // Not a video page, skip all checks
+    stopPageTrackingIntervals();
+    return;
   }
   const currentVideoId = getCurrentVideoId();
   
@@ -99,11 +117,11 @@ function checkUrlChange() {
       isRefreshing = false;
       // Only re-inject if we're still on a video page
       if (isVideoPage()) {
+        startPageTrackingIntervals(); // Ensure intervals run on video page
         if (typeof injectDownloadButton === 'function') {
           injectDownloadButton();
         }
         // Also restore active downloads when video is detected (in case of page refresh)
-        // Reset retry count to allow fresh retry attempts
         if (typeof resetRestoreRetryCount === 'function') {
           resetRestoreRetryCount();
         }
@@ -114,6 +132,9 @@ function checkUrlChange() {
         }, 1000);
       }
     }, 2500);
+  } else {
+    // Same URL/video - ensure intervals are running when on video page
+    startPageTrackingIntervals();
   }
 }
 
@@ -135,6 +156,7 @@ function cleanupDownloadsForVideo(videoId) {
  * Periodic check to verify button has correct data for current video
  */
 function verifyButtonData() {
+  if (!isVideoPage()) return; // Skip when not on video page (intervals may still be running briefly)
   if (isRefreshing) return;
   
   const buttonWrapper = document.getElementById('vimeo-downloader-page-button-wrapper');
@@ -184,18 +206,24 @@ function verifyButtonData() {
 }
 
 /**
- * Initialize page tracking
+ * Start URL and data check intervals (only when on video page)
  */
-function initializePageTracking() {
-  // Start URL change monitoring
+function startPageTrackingIntervals() {
+  if (!isVideoPage()) return;
   if (!urlCheckInterval) {
     urlCheckInterval = setInterval(checkUrlChange, 500);
   }
-
-  // Start periodic data verification (every 3 seconds)
   if (!dataCheckInterval) {
     dataCheckInterval = setInterval(verifyButtonData, 3000);
   }
+}
+
+/**
+ * Initialize page tracking
+ */
+function initializePageTracking() {
+  // Start intervals only when on video page (stopped when leaving video page)
+  startPageTrackingIntervals();
 
   // Also listen to history API changes (for SPA navigation)
   if (window.history && window.history.pushState) {
@@ -215,6 +243,15 @@ function initializePageTracking() {
       setTimeout(checkUrlChange, 100);
     });
   }
+
+  // When tab is hidden, stop intervals to save memory/CPU; restart when visible on video page
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      stopPageTrackingIntervals();
+    } else if (isVideoPage()) {
+      startPageTrackingIntervals();
+    }
+  });
 
   // Do NOT observe all DOM mutations to trigger injection: Dailymotion is a React SPA.
   // Firing inject on every mutation caused React hydration errors (#418/#423) and broken UI.
