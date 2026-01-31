@@ -221,6 +221,59 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
+    if (request.action === "convertPartToMp4") {
+      handleConvertPartToMp4(
+        request.blobId,
+        request.chunkCount,
+        request.totalSize,
+        request.partIndex,
+        request.partSizeBytes,
+      )
+        .then((result) => sendResponse(result))
+        .catch((err) => {
+          console.error("convertPartToMp4 error:", err);
+          sendResponse({ success: false, error: err.message });
+        });
+      return true;
+    }
+
+    if (request.action === "deleteChunksForBlob") {
+      const { blobId, chunkCount } = request;
+      if (!blobId || chunkCount == null) {
+        sendResponse({ success: false, error: "Missing blobId or chunkCount" });
+        return true;
+      }
+      (async () => {
+        try {
+          const db = await new Promise((resolve, reject) => {
+            const req = indexedDB.open("DailymotionDownloaderDB", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+              if (!e.target.result.objectStoreNames.contains("blobs")) {
+                e.target.result.createObjectStore("blobs");
+              }
+            };
+          });
+          const tx = db.transaction(["blobs"], "readwrite");
+          const store = tx.objectStore("blobs");
+          for (let i = 0; i < chunkCount; i++) {
+            store.delete(`${blobId}_chunk_${i}`);
+          }
+          await new Promise((resolve, reject) => {
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          sendResponse({ success: true });
+        } catch (err) {
+          console.error("deleteChunksForBlob failed:", err);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
     if (request.action === "downloadBlobFromIndexedDB") {
       console.log("Processing downloadBlobFromIndexedDB request:", {
         blobId: request.blobId,
@@ -458,4 +511,99 @@ async function handleConvertToMp4(blobId, downloadId, onProgress) {
     extension: "mp4",
     mimeType: "video/mp4",
   };
+}
+
+const TS_PACKET_SIZE = 188;
+
+/**
+ * Convert one part of TS (from IDB chunks) to MP4. Used when full-file conversion fails (e.g. 2GB+).
+ * Reads only the byte range [partIndex*partSizeBytes, (partIndex+1)*partSizeBytes), assembles
+ * at most partSizeBytes (default 500MB), aligns to TS packet boundary, runs FFmpeg, returns blob URL.
+ * Supports variable-size chunks (large-file path uses one chunk per segment batch, not fixed 32MB).
+ */
+async function handleConvertPartToMp4(blobId, chunkCount, totalSize, partIndex, partSizeBytes) {
+  partSizeBytes = partSizeBytes || 500 * 1024 * 1024;
+  const startByte = partIndex * partSizeBytes;
+  let endByte = Math.min(startByte + partSizeBytes, totalSize);
+  let partLength = endByte - startByte;
+  if (partLength <= 0) {
+    return { success: true, skipped: true, partIndex };
+  }
+  partLength = Math.floor(partLength / TS_PACKET_SIZE) * TS_PACKET_SIZE;
+  endByte = startByte + partLength;
+  if (partLength <= 0) {
+    return { success: true, skipped: true, partIndex };
+  }
+
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("DailymotionDownloaderDB", 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (event) => {
+      const d = event.target.result;
+      if (!d.objectStoreNames.contains("blobs")) {
+        d.createObjectStore("blobs");
+      }
+    };
+  });
+
+  const partBuffer = new Uint8Array(partLength);
+  let partOffset = 0;
+  let chunkStartInFile = 0;
+
+  for (let i = 0; i < chunkCount; i++) {
+    if (chunkStartInFile >= endByte) break;
+
+    const chunkKey = `${blobId}_chunk_${i}`;
+    const chunk = await new Promise((resolve, reject) => {
+      const tx = db.transaction(["blobs"], "readonly");
+      const req = tx.objectStore("blobs").get(chunkKey);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    if (!chunk || !(chunk instanceof ArrayBuffer)) {
+      db.close();
+      throw new Error(`Missing or invalid chunk ${i}`);
+    }
+    const chunkLen = chunk.byteLength;
+    const chunkEndInFile = chunkStartInFile + chunkLen;
+
+    if (chunkEndInFile <= startByte) {
+      chunkStartInFile = chunkEndInFile;
+      continue;
+    }
+
+    const overlapStart = Math.max(0, startByte - chunkStartInFile);
+    const overlapEnd = Math.min(chunkLen, endByte - chunkStartInFile);
+    const toCopy = overlapEnd - overlapStart;
+    if (toCopy > 0) {
+      partBuffer.set(new Uint8Array(chunk, overlapStart, toCopy), partOffset);
+      partOffset += toCopy;
+    }
+    chunkStartInFile = chunkEndInFile;
+  }
+  db.close();
+
+  const ffmpeg = await getFFmpeg();
+  await ffmpeg.writeFile("input.ts", partBuffer);
+  await ffmpeg.exec(["-i", "input.ts", "-c", "copy", "output.mp4"]);
+  const data = await ffmpeg.readFile("output.mp4");
+  try {
+    if (typeof ffmpeg.deleteFile === "function") {
+      await ffmpeg.deleteFile("input.ts");
+      await ffmpeg.deleteFile("output.mp4");
+    }
+  } catch (e) {}
+
+  const outputBuffer =
+    data instanceof Uint8Array
+      ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+      : data;
+  if (!outputBuffer || !(outputBuffer instanceof ArrayBuffer)) {
+    throw new Error("FFmpeg did not produce output for part");
+  }
+
+  const blob = new Blob([outputBuffer], { type: "video/mp4" });
+  const blobUrl = URL.createObjectURL(blob);
+  return { success: true, blobUrl, partIndex };
 }

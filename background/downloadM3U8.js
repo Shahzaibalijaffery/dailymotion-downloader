@@ -412,6 +412,135 @@ async function downloadViaBlobFromChunks(
   });
 }
 
+const CHUNKED_MP4_PART_SIZE_BYTES = 500 * 1024 * 1024; // 500MB per part
+
+/**
+ * When full-file MP4 conversion fails (e.g. 2GB+ allocation), convert TS in 500MB parts in offscreen,
+ * then download each part as part1.mp4, part2.mp4, ... Chunks stay in IDB until all parts are done.
+ */
+async function downloadViaChunkedMp4Conversion(
+  chunksOnlyForDownload,
+  finalFilename,
+  downloadId,
+  downloadControllers,
+  activeChromeDownloads,
+  setupOffscreenDocument,
+) {
+  const { blobId, chunkCount, totalSize } = chunksOnlyForDownload;
+  const partSizeBytes = CHUNKED_MP4_PART_SIZE_BYTES;
+  const numParts = Math.ceil(totalSize / partSizeBytes);
+  if (numParts <= 0) {
+    throw new Error("No parts to convert");
+  }
+  const baseName = finalFilename.replace(/\.ts$/i, "").trim();
+  const sanitize = typeof sanitizeFilenameForDownload === "function"
+    ? sanitizeFilenameForDownload
+    : (s) => s.replace(/[\\/:*?"<>|]/g, "_");
+
+  await setupOffscreenDocument();
+
+  for (let partIndex = 0; partIndex < numParts; partIndex++) {
+    const controllerInfo = downloadControllers.get(downloadId);
+    if (controllerInfo?.controller.signal.aborted) {
+      throw new Error("Download cancelled");
+    }
+    await chrome.storage.local.set({
+      [`downloadStatus_${downloadId}`]: `Converting to MP4 (part ${partIndex + 1}/${numParts})...`,
+    });
+
+    const convertResult = await new Promise((resolve, reject) => {
+      chrome.runtime.sendMessage(
+        {
+          action: "convertPartToMp4",
+          blobId,
+          chunkCount,
+          totalSize,
+          partIndex,
+          partSizeBytes,
+        },
+        (response) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+          } else {
+            resolve(response || { success: false });
+          }
+        },
+      );
+    });
+
+    if (convertResult.skipped) continue;
+    if (!convertResult.success || !convertResult.blobUrl) {
+      throw new Error(convertResult.error || "Part conversion failed");
+    }
+
+    const partFilename = sanitize(`${baseName}_part${partIndex + 1}.mp4`);
+    await chrome.storage.local.set({
+      [`downloadStatus_${downloadId}`]: `Saving part ${partIndex + 1}/${numParts}...`,
+    });
+
+    const controllerInfoPart = downloadControllers.get(downloadId);
+    await new Promise((resolve, reject) => {
+      const blobUrl = convertResult.blobUrl;
+      if (controllerInfoPart?.controller.signal.aborted) {
+        try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
+        reject(new Error("Download cancelled"));
+        return;
+      }
+      chrome.downloads.download(
+        { url: blobUrl, filename: partFilename, saveAs: false },
+        (chromeDownloadId) => {
+          if (chrome.runtime.lastError || chromeDownloadId === undefined) {
+            try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
+            reject(new Error(chrome.runtime.lastError?.message || "Download failed"));
+            return;
+          }
+          activeChromeDownloads.set(chromeDownloadId, {
+            downloadId,
+            blobUrl,
+            blobId: blobId + "_chunks_part",
+            filename: partFilename,
+          });
+          const revokeWhenDone = () => {
+            try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
+          };
+          const poll = () => {
+            chrome.downloads.search({ id: chromeDownloadId }, (results) => {
+              if (!results || results.length === 0) {
+                setTimeout(poll, 1000);
+                return;
+              }
+              const state = results[0].state;
+              if (state === "complete") {
+                activeChromeDownloads.delete(chromeDownloadId);
+                revokeWhenDone();
+                resolve();
+              } else if (state === "interrupted") {
+                activeChromeDownloads.delete(chromeDownloadId);
+                revokeWhenDone();
+                reject(new Error(results[0].error || "Download interrupted"));
+              } else {
+                setTimeout(poll, 1000);
+              }
+            });
+          };
+          poll();
+        },
+      );
+    });
+  }
+
+  await new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      { action: "deleteChunksForBlob", blobId, chunkCount },
+      (response) => {
+        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
+        else if (response && !response.success) reject(new Error(response.error || "Cleanup failed"));
+        else resolve();
+      },
+    );
+  });
+}
+
 async function downloadAndMergeM3U8(
   m3u8Url,
   filename,
@@ -1804,7 +1933,7 @@ async function downloadAndMergeM3U8(
     // Validate file structure by reading ONLY the first 8 bytes (avoids NotReadableError on large files).
     // Full mergedBlob.arrayBuffer() would duplicate the entire video in memory and hit limits.
     const header = new Uint8Array(await mergedBlob.slice(0, 8).arrayBuffer());
-    let validatedBlob = mergedBlob;
+    validatedBlob = mergedBlob;
 
     if (isMPEGTS) {
       // MPEG-TS validation: Check for sync byte (0x47) at the start
@@ -1998,6 +2127,7 @@ async function downloadAndMergeM3U8(
     }
 
     if (!converted) {
+      let fallbackStatus = "Download complete! (saved as .ts)";
       await chrome.storage.local.set({
         [`downloadProgress_${downloadId}`]: 100,
         [`downloadStatus_${downloadId}`]: "Saving as .ts (conversion failed or timed out)...",
@@ -2018,16 +2148,32 @@ async function downloadAndMergeM3U8(
         );
         cleanupIndexedDBBlob(inputBlobIdForConvert);
       } else if (chunksOnlyForDownload) {
-        // Stream URL fails (Chrome doesn't trigger our fetch → NETWORK_FAILED). Use blob-from-chunks directly.
-        console.log("[downloadM3U8] .ts fallback: saving via blob-from-chunks in offscreen");
-        await downloadViaBlobFromChunks(
-          chunksOnlyForDownload,
-          finalFilename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          setupOffscreenDocument,
-        );
+        // Try chunked MP4 conversion (500MB parts) so we get part1.mp4, part2.mp4, ... instead of one huge .ts
+        try {
+          console.log("[downloadM3U8] Trying chunked MP4 conversion (500MB parts)...");
+          await downloadViaChunkedMp4Conversion(
+            chunksOnlyForDownload,
+            finalFilename,
+            downloadId,
+            downloadControllers,
+            activeChromeDownloads,
+            setupOffscreenDocument,
+          );
+          fallbackStatus = "Download complete! (MP4 parts)";
+        } catch (chunkedErr) {
+          console.warn("[downloadM3U8] Chunked MP4 failed, saving as single .ts:", chunkedErr.message);
+          await chrome.storage.local.set({
+            [`downloadStatus_${downloadId}`]: "Saving as .ts (conversion failed or timed out)...",
+          });
+          await downloadViaBlobFromChunks(
+            chunksOnlyForDownload,
+            finalFilename,
+            downloadId,
+            downloadControllers,
+            activeChromeDownloads,
+            setupOffscreenDocument,
+          );
+        }
       } else {
         console.log("[downloadM3U8] .ts fallback: using validatedBlob (IDB not used)");
         await downloadBlob(
@@ -2042,7 +2188,7 @@ async function downloadAndMergeM3U8(
         );
       }
       await chrome.storage.local.set({
-        [`downloadStatus_${downloadId}`]: "Download complete! (saved as .ts)",
+        [`downloadStatus_${downloadId}`]: fallbackStatus,
       });
     } else if (inputBlobIdForConvert) {
       cleanupIndexedDBBlob(inputBlobIdForConvert);

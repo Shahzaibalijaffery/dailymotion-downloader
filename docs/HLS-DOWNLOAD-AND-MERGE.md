@@ -175,3 +175,25 @@ User clicks "Download" (e.g. 544p HLS)
 | **Save**        | One blob URL (from blob or from chunks assembled in offscreen) → `chrome.downloads.download` → one file on disk. |
 
 So “merging” is: **concatenating all segment data in order**, either as one in-memory blob (small files) or as indexed chunks in IDB that are later assembled or streamed for download (large files).
+
+---
+
+## 11. Why We Can’t Convert 2GB+ to MP4 in Chunks
+
+**FFmpeg.wasm limits:**
+
+- It uses an **in-memory virtual filesystem (MEMFS)**. In Chrome the practical limit is around **~261MB** per file; multi‑gigabyte files hit “Array buffer allocation failed”.
+- The API is **whole-file only**: `writeFile('input.ts', fullArrayBuffer)` and `readFile('output.mp4')` — there is **no streaming or chunked read/write**.
+- So we cannot “convert in 500MB chunks” inside the extension: FFmpeg still needs the full input and produces a full output in memory.
+
+**Why not “convert in 500MB chunks then download in 500MB parts”?**
+
+- TS → MP4 with `-c copy` is a **remux**: one logical input → one logical output. FFmpeg doesn’t support “give me chunk 1, I’ll give you MP4 part 1” in the browser API.
+- Splitting TS into 500MB pieces and running FFmpeg on each would give **multiple small MP4s**, not one playable file; merging those MP4s would again require loading large data in the extension.
+
+**Practical approach for 2GB+:**
+
+- The extension **saves as .ts** (which works via blob-from-chunks).
+- User can **convert to MP4 on their machine** (no memory limit):
+  - **VLC:** Media → Convert / Stream → output MP4.
+  - **FFmpeg (cli):** `ffmpeg -i video.ts -c copy video.mp4`
