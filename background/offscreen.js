@@ -12,14 +12,6 @@ console.log(
 );
 console.log("========================================");
 
-// UMD bundle (ffmpeg.min.js) exposes FFmpegWASM.FFmpeg, not global FFmpeg
-const FFmpegClass =
-  typeof FFmpeg !== "undefined"
-    ? FFmpeg
-    : typeof FFmpegWASM !== "undefined" && FFmpegWASM && FFmpegWASM.FFmpeg
-      ? FFmpegWASM.FFmpeg
-      : null;
-
 // Set up message listener immediately (don't wait for DOM)
 // This ensures the listener is ready as soon as possible
 console.log("Setting up chrome.runtime.onMessage listener...");
@@ -42,16 +34,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         console.warn("revokeBlobUrl failed:", e);
       }
       sendResponse({ success: true });
-      return true;
-    }
-
-    if (request.action === "checkFFmpeg") {
-      ensureFFmpegReady()
-        .then(() => sendResponse({ success: true }))
-        .catch((err) => {
-          console.warn("checkFFmpeg failed:", err);
-          sendResponse({ success: false, error: err.message });
-        });
       return true;
     }
 
@@ -199,28 +181,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
-    if (request.action === "convertToMp4") {
-      handleConvertToMp4(
-        request.blobId,
-        request.downloadId,
-        (progress) => {
-          try {
-            chrome.runtime.sendMessage({
-              action: "convertProgress",
-              downloadId: request.downloadId,
-              progress,
-            });
-          } catch (e) {}
-        },
-      )
-        .then((result) => sendResponse(result))
-        .catch((err) => {
-          console.error("convertToMp4 error:", err);
-          sendResponse({ success: false, error: err.message });
-        });
-      return true;
-    }
-
     if (request.action === "downloadBlobFromIndexedDB") {
       console.log("Processing downloadBlobFromIndexedDB request:", {
         blobId: request.blobId,
@@ -258,9 +218,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 console.log("✅ Message listener set up successfully!");
 
-// Send ready signal to background script (include FFmpeg availability)
-const ffmpegAvailable = FFmpegClass !== null;
-console.log("Sending offscreenReady signal to background script...");
+// Send ready signal to background script
+const ffmpegAvailable = false;
+console.log("Sending offscreenReady signal to background script (no FFmpeg)...");
 try {
   chrome.runtime.sendMessage({ action: "offscreenReady", ffmpegAvailable }, (response) => {
     if (chrome.runtime.lastError) {
@@ -278,7 +238,7 @@ try {
 
 console.log("========================================");
 console.log("✅ Offscreen document fully initialized and ready!");
-console.log("FFmpeg (ffmpeg.wasm) available:", FFmpegClass !== null);
+console.log("FFmpeg (ffmpeg.wasm) available:", false);
 console.log("Message listener is active and waiting for messages");
 console.log("========================================");
 
@@ -348,114 +308,6 @@ async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
   }
 }
 
-// FFmpeg.wasm: load core from extension files (no blob URLs = no CSP change)
-let ffmpegInstance = null;
-let ffmpegLoadPromise = null;
-
-async function getFFmpeg() {
-  if (!FFmpegClass) {
-    throw new Error("FFmpeg (ffmpeg.wasm) not loaded. Check offscreen script order.");
-  }
-  if (ffmpegInstance) return ffmpegInstance;
-  if (ffmpegLoadPromise) return ffmpegLoadPromise;
-  ffmpegLoadPromise = (async () => {
-    const coreURL = chrome.runtime.getURL("background/ffmpeg-core.js");
-    const wasmURL = chrome.runtime.getURL("background/ffmpeg-core.wasm");
-    const ffmpeg = new FFmpegClass();
-    await ffmpeg.load({ coreURL, wasmURL });
-    ffmpegInstance = ffmpeg;
-    return ffmpeg;
-  })();
-  return ffmpegLoadPromise;
-}
-
-/** Ensure FFmpeg is loaded and ready (used by checkFFmpeg and before convert). */
-async function ensureFFmpegReady() {
-  await getFFmpeg();
-}
-
-async function handleConvertToMp4(blobId, downloadId, onProgress) {
-  const db = await new Promise((resolve, reject) => {
-    const request = indexedDB.open("DailymotionDownloaderDB", 1);
-    request.onerror = () => reject(request.error);
-    request.onsuccess = () => resolve(request.result);
-    request.onupgradeneeded = (event) => {
-      const d = event.target.result;
-      if (!d.objectStoreNames.contains("blobs")) {
-        d.createObjectStore("blobs");
-      }
-    };
-  });
-
-  const arrayBuffer = await new Promise((resolve, reject) => {
-    const tx = db.transaction(["blobs"], "readonly");
-    const store = tx.objectStore("blobs");
-    const req = store.get(blobId);
-    req.onsuccess = () => {
-      const data = req.result;
-      if (!data || !(data instanceof ArrayBuffer)) {
-        reject(new Error(`Blob not found: ${blobId}`));
-      } else {
-        resolve(data);
-      }
-    };
-    req.onerror = () => reject(req.error || new Error("IDB read error"));
-  });
-  db.close();
-
-  const ffmpeg = await getFFmpeg();
-
-  ffmpeg.on("progress", ({ progress }) => {
-    if (typeof onProgress === "function") {
-      try {
-        onProgress(Math.min(1, Math.max(0, progress)));
-      } catch (e) {}
-    }
-  });
-
-  // Pass a single Uint8Array view so FFmpeg can transfer the buffer to the worker (no copy).
-  // The library uses postMessage(..., [data.buffer]) so the buffer is moved, not copied.
-  const inputData = new Uint8Array(arrayBuffer);
-  await ffmpeg.writeFile("input.ts", inputData);
-  await ffmpeg.exec(["-i", "input.ts", "-c", "copy", "output.mp4"]);
-  const data = await ffmpeg.readFile("output.mp4");
-  try {
-    if (typeof ffmpeg.deleteFile === "function") {
-      await ffmpeg.deleteFile("input.ts");
-      await ffmpeg.deleteFile("output.mp4");
-    }
-  } catch (e) {}
-
-  const outputBuffer =
-    data instanceof Uint8Array
-      ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
-      : data;
-  if (!outputBuffer || !(outputBuffer instanceof ArrayBuffer)) {
-    throw new Error("FFmpeg did not produce output");
-  }
-
-  const outputBlobId =
-    "convert_" + Date.now() + "_" + Math.random().toString(36).slice(2, 11);
-  await new Promise((resolve, reject) => {
-    const req = indexedDB.open("DailymotionDownloaderDB", 1);
-    req.onerror = () => reject(req.error);
-    req.onsuccess = () => {
-      const database = req.result;
-      const tx = database.transaction(["blobs"], "readwrite");
-      const store = tx.objectStore("blobs");
-      store.put(outputBuffer, outputBlobId);
-      tx.oncomplete = () => {
-        database.close();
-        resolve();
-      };
-      tx.onerror = () => reject(tx.error);
-    };
-  });
-
-  return {
-    success: true,
-    outputBlobId,
-    extension: "mp4",
-    mimeType: "video/mp4",
-  };
-}
+// All FFmpeg-related helpers have been removed. This offscreen document now only
+// handles blob assembly/storage and download helpers; it no longer performs any
+// media format conversion.

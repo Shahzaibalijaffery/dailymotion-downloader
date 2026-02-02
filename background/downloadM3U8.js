@@ -1683,7 +1683,6 @@ async function downloadAndMergeM3U8(
 
     let validatedBlob = null;
     let skippedMergeForLargeFile = false;
-    let inputBlobIdForConvert = null;
     let chunksOnlyForDownload = null;
     let finalFilename = filename || "dailymotion_video.mp4";
 
@@ -1698,7 +1697,9 @@ async function downloadAndMergeM3U8(
         finalFilename = finalFilename.replace(/\.[^.]*$/, "") + (isMPEGTS ? ".ts" : ".mp4");
       }
       console.log(
-        `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"}) — large file (${Math.round(totalSizeFromBlobs / 1024 / 1024)}MB), writing segment batches to IDB directly`,
+        `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"}) — large file (${Math.round(
+          totalSizeFromBlobs / 1024 / 1024,
+        )}MB), writing segment batches to IDB directly`,
       );
       const header = new Uint8Array(await finalBlobs[0].slice(0, 8).arrayBuffer());
       if (isMPEGTS && header[0] === 0x47) {
@@ -1707,7 +1708,9 @@ async function downloadAndMergeM3U8(
         const hasFtyp = header[4] === 0x66 && header[5] === 0x74 && header[6] === 0x79 && header[7] === 0x70;
         if (!hasFtyp) throw new Error("Merged file does not have valid MP4 structure (missing ftyp box).");
       }
-      inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      const inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2, 9)}`;
       const db = await new Promise((resolve, reject) => {
         const req = indexedDB.open("DailymotionDownloaderDB", 1);
         req.onerror = () => reject(req.error);
@@ -1754,10 +1757,10 @@ async function downloadAndMergeM3U8(
     }
 
     if (!isLargeFile) {
-    // Create final blob from all blobs
-    // Use appropriate MIME type: MPEG-TS uses 'video/mp2t', fMP4 uses 'video/mp4'
-    const finalMimeType = isMPEGTS ? "video/mp2t" : "video/mp4";
-    let mergedBlob = new Blob(finalBlobs, { type: finalMimeType });
+      // Create final blob from all blobs
+      // Use appropriate MIME type: MPEG-TS uses 'video/mp2t', fMP4 uses 'video/mp4'
+      const finalMimeType = isMPEGTS ? "video/mp2t" : "video/mp4";
+      let mergedBlob = new Blob(finalBlobs, { type: finalMimeType });
 
     // Free segment/final arrays BEFORE mergedBlob.arrayBuffer() to avoid NotReadableError on large files.
     // We only need mergedBlob from here; the next line reads it and needs memory headroom.
@@ -1801,10 +1804,10 @@ async function downloadAndMergeM3U8(
       throw new Error("Merged video file is too small. Download failed.");
     }
 
-    // Validate file structure by reading ONLY the first 8 bytes (avoids NotReadableError on large files).
-    // Full mergedBlob.arrayBuffer() would duplicate the entire video in memory and hit limits.
-    const header = new Uint8Array(await mergedBlob.slice(0, 8).arrayBuffer());
-    let validatedBlob = mergedBlob;
+      // Validate file structure by reading ONLY the first 8 bytes (avoids NotReadableError on large files).
+      // Full mergedBlob.arrayBuffer() would duplicate the entire video in memory and hit limits.
+      const header = new Uint8Array(await mergedBlob.slice(0, 8).arrayBuffer());
+      validatedBlob = mergedBlob;
 
     if (isMPEGTS) {
       // MPEG-TS validation: Check for sync byte (0x47) at the start
@@ -1845,208 +1848,69 @@ async function downloadAndMergeM3U8(
     }
     } // end if (!isLargeFile)
 
-    const sizeMB = Math.round((validatedBlob ? validatedBlob.size : totalSizeFromBlobs) / (1024 * 1024));
+    const sizeMB = Math.round(
+      (validatedBlob ? validatedBlob.size : totalSizeFromBlobs) / (1024 * 1024),
+    );
     console.log(`Total merged size: ${sizeMB}MB`);
 
     // Warn about potential playback issues
     if (missingIndices.length > 0) {
       console.warn(
-        `⚠️ HLS segments merged with ${missingIndices.length} missing segments - file may have playback issues. Prefer MP4 downloads when available.`,
+        `⚠️ HLS segments merged with ${missingIndices.length} missing segments - file may have playback issues.`,
       );
     } else {
       console.log(
-        "✅ All segments downloaded successfully - video should play correctly in QuickTime and VLC",
+        "✅ All segments downloaded successfully - video should play correctly in common players",
       );
     }
 
-    // Free merge-phase memory before conversion/download
+    // Free merge-phase memory before download
     segmentData.length = 0;
     if (orderedSegments && orderedSegments.length) orderedSegments.length = 0;
     if (segmentBuffers && segmentBuffers.length) segmentBuffers.length = 0;
     segmentBlobs.length = 0;
     finalBlobs.length = 0;
 
-    const mp4Filename = finalFilename.replace(/\.(ts|mpegts|mkv|webm)$/i, ".mp4");
-    const alreadyMp4 = /\.mp4$/i.test(finalFilename);
-    let converted = false;
-    let storedInputInIDB = false;
+    // We no longer convert with FFmpeg — just save the merged stream as-is.
+    await chrome.storage.local.set({
+      [`downloadProgress_${downloadId}`]: 100,
+      [`downloadStatus_${downloadId}`]: "Saving video file...",
+    });
 
-    // Skip conversion when merged output is already MP4 (fMP4) — avoids loading helper iframe and potential hang
-    if (!alreadyMp4) try {
-      await chrome.storage.local.set({
-        [`downloadStatus_${downloadId}`]: "Converting to MP4...",
-      });
-      if (!skippedMergeForLargeFile) {
-        inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-      }
-      await setupOffscreenDocument();
-
-      if (!skippedMergeForLargeFile) {
-        // Store merged blob in IDB in chunks so the SW never holds the whole blob in memory
-        const CHUNK_SIZE = 32 * 1024 * 1024; // 32MB per chunk
-        const totalSize = validatedBlob.size;
-        const chunkCount = Math.ceil(totalSize / CHUNK_SIZE);
-        try {
-          const db = await new Promise((resolve, reject) => {
-            const req = indexedDB.open("DailymotionDownloaderDB", 1);
-            req.onerror = () => reject(req.error);
-            req.onsuccess = () => resolve(req.result);
-            req.onupgradeneeded = (e) => {
-              if (!e.target.result.objectStoreNames.contains("blobs")) {
-                e.target.result.createObjectStore("blobs");
-              }
-            };
-          });
-          for (let i = 0; i < chunkCount; i++) {
-            const start = i * CHUNK_SIZE;
-            const end = Math.min(start + CHUNK_SIZE, totalSize);
-            const chunk = validatedBlob.slice(start, end);
-            const chunkBuffer = await chunk.arrayBuffer();
-            const chunkKey = `${inputBlobIdForConvert}_chunk_${i}`;
-            await new Promise((resolve, reject) => {
-              const tx = db.transaction(["blobs"], "readwrite");
-              tx.objectStore("blobs").put(chunkBuffer, chunkKey);
-              tx.oncomplete = () => resolve();
-              tx.onerror = () => reject(tx.error);
-            });
-            if (i % 20 === 0 && chunkCount > 20) {
-              await chrome.storage.local.set({
-                [`downloadStatus_${downloadId}`]: `Storing for conversion (chunk ${i + 1}/${chunkCount})...`,
-              });
-            }
-          }
-          db.close();
-        } catch (storeErr) {
-          throw new Error(storeErr?.message || "Failed to store blob in IDB");
-        }
-      }
-
-      // Offscreen assembles chunks into one blob under inputBlobIdForConvert (or we already have chunks from large-file path)
-      const totalSize = skippedMergeForLargeFile ? chunksOnlyForDownload.totalSize : validatedBlob.size;
-      const chunkCount = skippedMergeForLargeFile ? chunksOnlyForDownload.chunkCount : Math.ceil(totalSize / (32 * 1024 * 1024));
-      const assembleResult = await new Promise((resolve) => {
-        chrome.runtime.sendMessage(
-          {
-            action: "assembleChunksForConvert",
-            blobId: inputBlobIdForConvert,
-            chunkCount,
-            totalSize,
-          },
-          (response) => {
-            if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
-            else resolve(response || { success: false, error: "No response" });
-          },
-        );
-      });
-      if (!assembleResult || !assembleResult.success) {
-        chunksOnlyForDownload = { blobId: inputBlobIdForConvert, chunkCount, totalSize };
-        throw new Error(assembleResult?.error || "Failed to assemble chunks in IDB");
-      }
-      storedInputInIDB = true;
-      // FFmpeg check (same idea as sound-catcher): ensure FFmpeg is loadable before starting conversion
-      const checkResult = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ action: "checkFFmpeg" }, (response) => {
-          if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
-          else resolve(response || { success: false, error: "No response" });
-        });
-      });
-      if (!checkResult || !checkResult.success) {
-        const errMsg = checkResult?.error || "FFmpeg is not available";
-        await chrome.storage.local.set({
-          [`downloadProgress_${downloadId}`]: 0,
-          [`downloadStatus_${downloadId}`]: errMsg,
-        });
-        throw new Error(errMsg);
-      }
-      const CONVERT_RESPONSE_TIMEOUT_MS = 7 * 60 * 1000;
-      const convertResult = await new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          reject(new Error("Conversion timed out (7 min)"));
-        }, CONVERT_RESPONSE_TIMEOUT_MS);
-        chrome.runtime.sendMessage(
-          { action: "convertToMp4", blobId: inputBlobIdForConvert, downloadId },
-          (response) => {
-            clearTimeout(timeoutId);
-            if (chrome.runtime.lastError) {
-              reject(new Error(chrome.runtime.lastError.message));
-            } else {
-              resolve(response);
-            }
-          },
-        );
-      });
-
-      if (convertResult && convertResult.success && convertResult.outputBlobId) {
-        converted = true;
-        await chrome.storage.local.set({
-          [`downloadProgress_${downloadId}`]: 100,
-          [`downloadStatus_${downloadId}`]: "Saving MP4...",
-        });
-        await downloadBlob(
-          { blobId: convertResult.outputBlobId },
-          mp4Filename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          cleanupIndexedDBBlob,
-          setupOffscreenDocument,
-          blobToDataUrl,
-        );
-      }
-    } catch (convertErr) {
-      console.warn("Convert to MP4 failed, saving as .ts:", convertErr.message);
+    // Use the same robust fallback logic that previously ran when conversion failed,
+    // but without any FFmpeg/IDB-conversion paths.
+    if (chunksOnlyForDownload) {
+      // Stream URL fails (Chrome doesn't trigger our fetch → NETWORK_FAILED). Use blob-from-chunks directly.
+      console.log(
+        "[downloadM3U8] saving via blob-from-chunks in offscreen (no conversion)",
+      );
+      await downloadViaBlobFromChunks(
+        chunksOnlyForDownload,
+        finalFilename,
+        downloadId,
+        downloadControllers,
+        activeChromeDownloads,
+        setupOffscreenDocument,
+      );
+    } else {
+      console.log(
+        "[downloadM3U8] saving merged stream directly (no conversion)",
+      );
+      await downloadBlob(
+        validatedBlob,
+        finalFilename,
+        downloadId,
+        downloadControllers,
+        activeChromeDownloads,
+        cleanupIndexedDBBlob,
+        setupOffscreenDocument,
+        blobToDataUrl,
+      );
     }
 
-    if (!converted) {
-      await chrome.storage.local.set({
-        [`downloadProgress_${downloadId}`]: 100,
-        [`downloadStatus_${downloadId}`]: "Saving as .ts (conversion failed or timed out)...",
-      });
-      // Use IDB for .ts fallback when we stored the merged blob there: validatedBlob is no longer
-      // readable after arrayBuffer() and would throw NotReadableError if used again.
-      if (storedInputInIDB && inputBlobIdForConvert) {
-        console.log("[downloadM3U8] .ts fallback: using IDB blob", inputBlobIdForConvert);
-        await downloadBlob(
-          { blobId: inputBlobIdForConvert },
-          finalFilename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          cleanupIndexedDBBlob,
-          setupOffscreenDocument,
-          blobToDataUrl,
-        );
-        cleanupIndexedDBBlob(inputBlobIdForConvert);
-      } else if (chunksOnlyForDownload) {
-        // Stream URL fails (Chrome doesn't trigger our fetch → NETWORK_FAILED). Use blob-from-chunks directly.
-        console.log("[downloadM3U8] .ts fallback: saving via blob-from-chunks in offscreen");
-        await downloadViaBlobFromChunks(
-          chunksOnlyForDownload,
-          finalFilename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          setupOffscreenDocument,
-        );
-      } else {
-        console.log("[downloadM3U8] .ts fallback: using validatedBlob (IDB not used)");
-        await downloadBlob(
-          validatedBlob,
-          finalFilename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          cleanupIndexedDBBlob,
-          setupOffscreenDocument,
-          blobToDataUrl,
-        );
-      }
-      await chrome.storage.local.set({
-        [`downloadStatus_${downloadId}`]: "Download complete! (saved as .ts)",
-      });
-    } else if (inputBlobIdForConvert) {
-      cleanupIndexedDBBlob(inputBlobIdForConvert);
-    }
+    await chrome.storage.local.set({
+      [`downloadStatus_${downloadId}`]: "Download complete!",
+    });
 
     // Release validatedBlob only AFTER download is fully complete (Chrome download + blob URL revoked).
     // Delay cleanup so we don't clear in the same tick; wait until everything is truly done.
