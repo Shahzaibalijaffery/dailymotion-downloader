@@ -992,6 +992,18 @@ function updateActiveVideo(tabId, currentVideoId = null) {
         });
       }
 
+      // Only keep records for the current video — remove other videos' URLs and titles
+      const activeVideoIdForPrune = currentVideoId;
+      videoData[tabId].urls = videoData[tabId].urls.filter(
+        (u) => u.videoId === activeVideoIdForPrune,
+      );
+      if (videoData[tabId].videoIds && activeVideoIdForPrune) {
+        const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
+        videoData[tabId].videoIds = keepTitle
+          ? { [activeVideoIdForPrune]: keepTitle }
+          : {};
+      }
+
       console.log("Active video updated (by videoId):", {
         videoId: currentVideoId,
         url: mostRecent.url,
@@ -1013,6 +1025,19 @@ function updateActiveVideo(tabId, currentVideoId = null) {
     if (mostRecent) {
       mostRecent.active = true;
       videoData[tabId].activeUrl = mostRecent.url;
+      // Only keep records for this current video
+      const activeVideoIdForPrune = mostRecent.videoId;
+      if (activeVideoIdForPrune) {
+        videoData[tabId].urls = videoData[tabId].urls.filter(
+          (u) => u.videoId === activeVideoIdForPrune,
+        );
+        if (videoData[tabId].videoIds) {
+          const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
+          videoData[tabId].videoIds = keepTitle
+            ? { [activeVideoIdForPrune]: keepTitle }
+            : {};
+        }
+      }
     }
     return;
   }
@@ -1048,6 +1073,20 @@ function updateActiveVideo(tabId, currentVideoId = null) {
         v.active = true;
       }
     });
+  }
+
+  // Only keep records for the current video — remove other videos' URLs and titles
+  const activeVideoIdForPrune = mostRecentNetwork.videoId;
+  if (activeVideoIdForPrune) {
+    videoData[tabId].urls = videoData[tabId].urls.filter(
+      (u) => u.videoId === activeVideoIdForPrune,
+    );
+    if (videoData[tabId].videoIds) {
+      const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
+      videoData[tabId].videoIds = keepTitle
+        ? { [activeVideoIdForPrune]: keepTitle }
+        : {};
+    }
   }
 
   console.log("Active video updated:", {
@@ -1095,23 +1134,31 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       tabId = sender.tab.id;
     }
 
-    const data = videoData[tabId] || { urls: [] };
+    const raw = videoData[tabId] || { urls: [] };
+
+    // Only send the current video to the popup — filter by active video
+    const activeVideoId = raw.activeUrl
+      ? raw.urls.find((u) => u.url === raw.activeUrl)?.videoId
+      : null;
+    const urls = activeVideoId
+      ? raw.urls.filter((v) => v.videoId === activeVideoId)
+      : raw.urls;
+    const videoIds = raw.videoIds || {};
+    const data = {
+      urls,
+      activeUrl: raw.activeUrl,
+      videoTitle: raw.videoTitle,
+      videoIds: activeVideoId && videoIds[activeVideoId]
+        ? { [activeVideoId]: videoIds[activeVideoId] }
+        : videoIds,
+    };
 
     // Update badge when popup requests data (in case it wasn't updated during navigation)
     if (tabId) {
       updateBadge(tabId);
     }
 
-    console.log("Sending video data for tabId:", tabId);
-    console.log("Total URLs in data:", data.urls.length);
-    console.log(
-      "URL types:",
-      data.urls.map((v) => ({
-        type: v.type,
-        videoId: v.videoId,
-        url: v.url.substring(0, 60) + "...",
-      })),
-    );
+    console.log("Sending video data for tabId:", tabId, "(current video only, URLs:", data.urls.length, ")");
     sendResponse({ videoData: data });
   } else if (request.action === "getDownloadInfo") {
     // Return download info for a specific download ID
