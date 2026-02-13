@@ -12,7 +12,8 @@
     "webRequest",
     "storage",
     "offscreen",
-    "cookies"
+    "cookies",
+    "scripting"
   ],
   "host_permissions": [
     "*://*.dailymotion.com/*",

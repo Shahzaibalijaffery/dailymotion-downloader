@@ -242,6 +242,50 @@ function parseMasterPlaylist(playlistText, baseUrl) {
 }
 
 /**
+ * Parse master playlist for EXT-X-MEDIA TYPE=AUDIO (alternate/audio-only tracks).
+ * @param {string} playlistText - The master playlist text
+ * @param {string} baseUrl - Base URL for resolving relative URIs
+ * @returns {Array<{ url: string, name: string }>}
+ */
+function parseMasterPlaylistAudio(playlistText, baseUrl) {
+  const lines = playlistText.split("\n");
+  const audioTracks = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith("#EXT-X-MEDIA:")) continue;
+
+    const typeMatch = line.match(/TYPE=([^,]+)/i);
+    if (!typeMatch || typeMatch[1].toUpperCase() !== "AUDIO") continue;
+
+    const uriMatch = line.match(/URI="([^"]+)"/) || line.match(/URI='([^']+)'/);
+    if (!uriMatch || !uriMatch[1]) continue;
+
+    const nameMatch = line.match(/NAME="([^"]+)"/) || line.match(/NAME='([^']+)'/);
+    const name = nameMatch ? nameMatch[1] : "Audio";
+
+    let trackUrl;
+    const uri = uriMatch[1].trim();
+    if (uri.startsWith("http://") || uri.startsWith("https://")) {
+      trackUrl = uri;
+    } else if (uri.startsWith("/")) {
+      try {
+        const urlObj = new URL(baseUrl);
+        trackUrl = `${urlObj.protocol}//${urlObj.host}${uri}`;
+      } catch (e) {
+        continue;
+      }
+    } else {
+      trackUrl = baseUrl + uri;
+    }
+
+    audioTracks.push({ url: trackUrl, name });
+  }
+
+  return audioTracks;
+}
+
+/**
  * Download and merge M3U8 playlist segments into a single video file
  * @param {string} m3u8Url - The M3U8 playlist URL
  * @param {string} filename - The filename for the final video
@@ -2240,9 +2284,11 @@ async function parseAndStoreHLSVariants(
     const playlistText = await response.text();
     console.log("Master playlist fetched, length:", playlistText.length);
 
-    if (!playlistText || !playlistText.includes("#EXT-X-STREAM-INF")) {
-      // Not a master playlist, or already a variant playlist
-      console.log("Not a master playlist or no #EXT-X-STREAM-INF found");
+    const hasVideoVariants = playlistText && playlistText.includes("#EXT-X-STREAM-INF");
+    const hasAudioMedia = playlistText && /#EXT-X-MEDIA:.*TYPE=AUDIO/i.test(playlistText);
+
+    if (!hasVideoVariants && !hasAudioMedia) {
+      console.log("Not a master playlist (no EXT-X-STREAM-INF or EXT-X-MEDIA TYPE=AUDIO)");
       return;
     }
 
@@ -2252,19 +2298,28 @@ async function parseAndStoreHLSVariants(
       masterPlaylistUrl.lastIndexOf("/") + 1,
     );
 
-    // Parse variants from master playlist
-    const variants = parseMasterPlaylist(playlistText, baseUrl);
-    console.log(
-      `Found ${variants.length} HLS variants:`,
-      variants.map((v) => ({
-        resolution: v.resolution,
-        bandwidth: v.bandwidth,
-        url: v.url.substring(0, 60) + "...",
-      })),
-    );
+    const variants = hasVideoVariants ? parseMasterPlaylist(playlistText, baseUrl) : [];
+    const audioTracks = hasAudioMedia ? parseMasterPlaylistAudio(playlistText, baseUrl) : [];
 
-    if (variants.length === 0) {
-      console.log("No variants found in master playlist");
+    if (variants.length > 0) {
+      console.log(
+        `Found ${variants.length} HLS variants:`,
+        variants.map((v) => ({
+          resolution: v.resolution,
+          bandwidth: v.bandwidth,
+          url: v.url.substring(0, 60) + "...",
+        })),
+      );
+    }
+    if (audioTracks.length > 0) {
+      console.log(
+        `Found ${audioTracks.length} audio track(s):`,
+        audioTracks.map((a) => ({ name: a.name, url: a.url.substring(0, 60) + "..." })),
+      );
+    }
+
+    if (variants.length === 0 && audioTracks.length === 0) {
+      console.log("No video variants or audio tracks found in master playlist");
       return;
     }
 
@@ -2405,7 +2460,7 @@ async function parseAndStoreHLSVariants(
       );
     }
 
-    // Store each variant with quality information
+    // Store each video variant with quality information
     let storedCount = 0;
     variants.forEach((variant, index) => {
       // Extract quality from resolution (e.g., "1920x1080" -> "1080p")
@@ -2439,8 +2494,18 @@ async function parseAndStoreHLSVariants(
       );
     });
 
+    // Store each audio track (EXT-X-MEDIA TYPE=AUDIO)
+    audioTracks.forEach((track, index) => {
+      const type = audioTracks.length > 1 ? `hls-audio-${track.name.replace(/\s+/g, "_")}` : "hls-audio";
+      storeVideoUrl(tabId, track.url, type, false, videoTitle, videoId);
+      storedCount++;
+      console.log(
+        `Stored HLS audio ${index + 1}/${audioTracks.length}: ${track.name} (videoId: ${videoId}) - ${track.url.substring(0, 80)}...`,
+      );
+    });
+
     console.log(
-      `Successfully stored ${storedCount} HLS variants for tab ${tabId}`,
+      `Successfully stored ${storedCount} HLS variant(s) and audio for tab ${tabId}`,
     );
   } catch (error) {
     console.error("Failed to parse HLS master playlist for variants:", error);

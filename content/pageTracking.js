@@ -8,6 +8,7 @@ let lastUrl = window.location.href;
 let lastVideoId = null;
 let urlCheckInterval = null;
 let dataCheckInterval = null;
+let transitionCheckInterval = null; // When not on /video, poll to detect navigation TO /video
 let isRefreshing = false; // Prevent multiple simultaneous refreshes
 
 /**
@@ -68,16 +69,73 @@ function stopPageTrackingIntervals() {
 }
 
 /**
+ * Stop the "transition to video page" poll (used when we're on a non-video page)
+ */
+function stopTransitionCheckInterval() {
+  if (transitionCheckInterval) {
+    clearInterval(transitionCheckInterval);
+    transitionCheckInterval = null;
+  }
+}
+
+/**
+ * When we're NOT on a video page, poll to detect navigation TO /video (SPA may not use pushState).
+ * When we detect we're now on a video page, run the same logic as checkUrlChange and inject the button.
+ */
+function checkTransitionToVideoPage() {
+  if (isVideoPage()) {
+    const currentUrl = window.location.href;
+    const currentVideoId = getCurrentVideoId();
+    if (currentUrl !== lastUrl || (currentVideoId && currentVideoId !== lastVideoId)) {
+      lastUrl = currentUrl;
+      lastVideoId = currentVideoId;
+      stopTransitionCheckInterval();
+      if (isRefreshing) return;
+      isRefreshing = true;
+      if (typeof destroyDownloadButton === 'function') {
+        destroyDownloadButton();
+      } else {
+        document.querySelectorAll('#vimeo-downloader-page-button-wrapper').forEach((w) => w.remove());
+      }
+      setTimeout(() => {
+        isRefreshing = false;
+        if (isVideoPage()) {
+          startPageTrackingIntervals();
+          if (typeof injectDownloadButton === 'function') {
+            injectDownloadButton();
+          }
+          if (typeof resetRestoreRetryCount === 'function') resetRestoreRetryCount();
+          setTimeout(() => {
+            if (typeof restoreActiveDownloads === 'function') restoreActiveDownloads();
+          }, 1000);
+        }
+      }, 2500);
+    }
+  }
+}
+
+/**
+ * Start polling for transition to video page (only when currently NOT on a video page)
+ */
+function startTransitionCheckInterval() {
+  if (isVideoPage()) return;
+  if (transitionCheckInterval) return;
+  transitionCheckInterval = setInterval(checkTransitionToVideoPage, 1500);
+}
+
+/**
  * Check for URL changes and re-inject button if needed
  */
 function checkUrlChange() {
   const currentUrl = window.location.href;
   
-  // Stop intervals when not on video page to reduce memory/CPU
+  // When not on video page: stop video-page intervals and start polling for transition TO /video
   if (!isVideoPage()) {
     stopPageTrackingIntervals();
+    startTransitionCheckInterval();
     return;
   }
+  stopTransitionCheckInterval();
   const currentVideoId = getCurrentVideoId();
   
   if (currentUrl !== lastUrl || (currentVideoId && currentVideoId !== lastVideoId)) {
@@ -210,6 +268,7 @@ function verifyButtonData() {
  */
 function startPageTrackingIntervals() {
   if (!isVideoPage()) return;
+  stopTransitionCheckInterval();
   if (!urlCheckInterval) {
     urlCheckInterval = setInterval(checkUrlChange, 500);
   }
@@ -222,8 +281,12 @@ function startPageTrackingIntervals() {
  * Initialize page tracking
  */
 function initializePageTracking() {
-  // Start intervals only when on video page (stopped when leaving video page)
-  startPageTrackingIntervals();
+  // On video page: run URL/data intervals. On other pages: poll for transition to /video
+  if (isVideoPage()) {
+    startPageTrackingIntervals();
+  } else {
+    startTransitionCheckInterval();
+  }
 
   // Also listen to history API changes (for SPA navigation)
   if (window.history && window.history.pushState) {
@@ -244,12 +307,17 @@ function initializePageTracking() {
     });
   }
 
-  // When tab is hidden, stop intervals to save memory/CPU; restart when visible on video page
+  // When tab is hidden, stop intervals to save memory/CPU; restart when visible
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
       stopPageTrackingIntervals();
-    } else if (isVideoPage()) {
-      startPageTrackingIntervals();
+      stopTransitionCheckInterval();
+    } else {
+      if (isVideoPage()) {
+        startPageTrackingIntervals();
+      } else {
+        startTransitionCheckInterval();
+      }
     }
   });
 

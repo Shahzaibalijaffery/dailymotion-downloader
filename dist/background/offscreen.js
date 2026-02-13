@@ -6,7 +6,10 @@
 console.log("========================================");
 console.log("Offscreen document script EXECUTING!");
 console.log("Script location:", window.location.href);
-console.log("Chrome runtime available:", typeof chrome !== 'undefined' && typeof chrome.runtime !== 'undefined');
+console.log(
+  "Chrome runtime available:",
+  typeof chrome !== "undefined" && typeof chrome.runtime !== "undefined",
+);
 console.log("========================================");
 
 // Set up message listener immediately (don't wait for DOM)
@@ -15,14 +18,14 @@ console.log("Setting up chrome.runtime.onMessage listener...");
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   try {
     console.log("Offscreen document received message:", request.action);
-    
+
     if (request.action === "ping") {
       // Respond to ping to verify we're ready
       console.log("Offscreen document responding to ping");
       sendResponse({ success: true, ready: true });
       return true;
     }
-    
+
     if (request.action === "revokeBlobUrl" && request.blobUrl) {
       try {
         URL.revokeObjectURL(request.blobUrl);
@@ -34,14 +37,158 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
+    if (request.action === "buildBlobFromChunksForDownload") {
+      const { blobId, chunkCount } = request;
+      if (!blobId || chunkCount == null) {
+        sendResponse({ success: false, error: "Missing blobId or chunkCount" });
+        return true;
+      }
+      (async () => {
+        try {
+          const db = await new Promise((resolve, reject) => {
+            const req = indexedDB.open("DailymotionDownloaderDB", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+              if (!e.target.result.objectStoreNames.contains("blobs")) {
+                e.target.result.createObjectStore("blobs");
+              }
+            };
+          });
+          const parts = [];
+          for (let i = 0; i < chunkCount; i++) {
+            const chunkKey = `${blobId}_chunk_${i}`;
+            const chunk = await new Promise((resolve, reject) => {
+              const tx = db.transaction(["blobs"], "readonly");
+              const req = tx.objectStore("blobs").get(chunkKey);
+              req.onsuccess = () => resolve(req.result);
+              req.onerror = () => reject(req.error);
+            });
+            if (!chunk || !(chunk instanceof ArrayBuffer)) {
+              throw new Error(`Missing or invalid chunk ${i}`);
+            }
+            parts.push(chunk);
+          }
+          const blob = new Blob(parts, { type: "video/mp2t" });
+          const blobUrl = URL.createObjectURL(blob);
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(["blobs"], "readwrite");
+            const store = tx.objectStore("blobs");
+            for (let i = 0; i < chunkCount; i++) {
+              store.delete(`${blobId}_chunk_${i}`);
+            }
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          sendResponse({ success: true, blobUrl });
+        } catch (err) {
+          console.error("buildBlobFromChunksForDownload failed:", err);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === "assembleChunksForConvert") {
+      const { blobId, chunkCount, totalSize } = request;
+      if (!blobId || chunkCount == null || !totalSize) {
+        sendResponse({ success: false, error: "Missing blobId, chunkCount or totalSize" });
+        return true;
+      }
+      (async () => {
+        try {
+          const db = await new Promise((resolve, reject) => {
+            const req = indexedDB.open("DailymotionDownloaderDB", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+              if (!e.target.result.objectStoreNames.contains("blobs")) {
+                e.target.result.createObjectStore("blobs");
+              }
+            };
+          });
+          const result = new Uint8Array(totalSize);
+          let offset = 0;
+          for (let i = 0; i < chunkCount; i++) {
+            const chunkKey = `${blobId}_chunk_${i}`;
+            const chunk = await new Promise((resolve, reject) => {
+              const tx = db.transaction(["blobs"], "readonly");
+              const req = tx.objectStore("blobs").get(chunkKey);
+              req.onsuccess = () => resolve(req.result);
+              req.onerror = () => reject(req.error);
+            });
+            if (!chunk || !(chunk instanceof ArrayBuffer)) {
+              throw new Error(`Missing or invalid chunk ${i}`);
+            }
+            result.set(new Uint8Array(chunk), offset);
+            offset += chunk.byteLength;
+          }
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(["blobs"], "readwrite");
+            const store = tx.objectStore("blobs");
+            store.put(result.buffer, blobId);
+            for (let i = 0; i < chunkCount; i++) {
+              store.delete(`${blobId}_chunk_${i}`);
+            }
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          sendResponse({ success: true });
+        } catch (err) {
+          console.error("assembleChunksForConvert failed:", err);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
+    if (request.action === "storeBlobFromUrl") {
+      const { blobUrl, blobId } = request;
+      if (!blobUrl || !blobId) {
+        sendResponse({ success: false, error: "Missing blobUrl or blobId" });
+        return true;
+      }
+      (async () => {
+        try {
+          const res = await fetch(blobUrl);
+          if (!res.ok) throw new Error(`Fetch failed: ${res.status}`);
+          const arrayBuffer = await res.arrayBuffer();
+          const db = await new Promise((resolve, reject) => {
+            const req = indexedDB.open("DailymotionDownloaderDB", 1);
+            req.onerror = () => reject(req.error);
+            req.onsuccess = () => resolve(req.result);
+            req.onupgradeneeded = (e) => {
+              if (!e.target.result.objectStoreNames.contains("blobs")) {
+                e.target.result.createObjectStore("blobs");
+              }
+            };
+          });
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction(["blobs"], "readwrite");
+            tx.objectStore("blobs").put(arrayBuffer, blobId);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          sendResponse({ success: true });
+        } catch (err) {
+          console.error("storeBlobFromUrl failed:", err);
+          sendResponse({ success: false, error: err.message });
+        }
+      })();
+      return true;
+    }
+
     if (request.action === "downloadBlobFromIndexedDB") {
       console.log("Processing downloadBlobFromIndexedDB request:", {
         blobId: request.blobId,
         filename: request.filename,
         mimeType: request.mimeType,
-        expectedSize: request.expectedSize
+        expectedSize: request.expectedSize,
       });
-      
+
       handleBlobDownload(
         request.blobId,
         request.filename,
@@ -59,7 +206,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         });
       return true; // Keep channel open for async response
     }
-    
+
     console.log("Unknown action:", request.action);
     return false;
   } catch (error) {
@@ -72,11 +219,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 console.log("✅ Message listener set up successfully!");
 
 // Send ready signal to background script
-console.log("Sending offscreenReady signal to background script...");
+const ffmpegAvailable = false;
+console.log("Sending offscreenReady signal to background script (no FFmpeg)...");
 try {
-  chrome.runtime.sendMessage({ action: 'offscreenReady' }, (response) => {
+  chrome.runtime.sendMessage({ action: "offscreenReady", ffmpegAvailable }, (response) => {
     if (chrome.runtime.lastError) {
-      console.warn("❌ Error sending offscreenReady:", chrome.runtime.lastError.message);
+      console.warn(
+        "❌ Error sending offscreenReady:",
+        chrome.runtime.lastError.message,
+      );
     } else {
       console.log("✅ Offscreen document ready signal sent successfully!");
     }
@@ -87,6 +238,7 @@ try {
 
 console.log("========================================");
 console.log("✅ Offscreen document fully initialized and ready!");
+console.log("FFmpeg (ffmpeg.wasm) available:", false);
 console.log("Message listener is active and waiting for messages");
 console.log("========================================");
 
@@ -155,3 +307,7 @@ async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
     throw error;
   }
 }
+
+// All FFmpeg-related helpers have been removed. This offscreen document now only
+// handles blob assembly/storage and download helpers; it no longer performs any
+// media format conversion.

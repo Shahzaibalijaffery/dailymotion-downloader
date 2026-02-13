@@ -76,6 +76,80 @@ function cleanupAllResources() {
   }
 }
 
+// Content script files (same order as manifest) — for programmatic injection into tabs that were open before install
+const CONTENT_SCRIPT_FILES = [
+  "scripts/utils.js",
+  "scripts/storage.js",
+  "scripts/messaging.js",
+  "content/utils.js",
+  "content/videoExtraction.js",
+  "content/restoreDownloads.js",
+  "content/downloadNotifications.js",
+  "content/pageTracking.js",
+  "content/downloadButton.js",
+  "content/content.js",
+];
+
+/**
+ * Inject content scripts into a Dailymotion tab (e.g. tab was open before extension install).
+ * @param {number} tabId
+ * @returns {Promise<void>}
+ */
+// Delays (ms) to ask content script to inject the button after programmatic inject (DOM/React may not be ready at first)
+const INJECT_BUTTON_RETRY_DELAYS_MS = [6000, 12000];
+
+function injectContentScriptIntoTab(tabId) {
+  if (!chrome.scripting || !chrome.scripting.executeScript) return Promise.resolve();
+  return chrome.scripting
+    .executeScript({
+      target: { tabId },
+      files: CONTENT_SCRIPT_FILES,
+    })
+    .then(() => {
+      console.log("[DM Downloader] Injected content script into tab", tabId);
+      // Content script will try at ~4.5s; if DOM wasn't ready, request again at 6s and 12s
+      INJECT_BUTTON_RETRY_DELAYS_MS.forEach((delayMs) => {
+        setTimeout(() => {
+          chrome.tabs.sendMessage(tabId, { action: "requestInjectButton" }, () => {
+            if (chrome.runtime.lastError) {
+              // Tab closed or script not ready; ignore
+            }
+          });
+        }, delayMs);
+      });
+    })
+    .catch((err) => {
+      console.warn("[DM Downloader] Failed to inject content script into tab", tabId, err);
+    });
+}
+
+/**
+ * If the tab has no content script (e.g. page was open before install), inject so the download button can appear.
+ * @param {number} tabId
+ */
+function ensureContentScriptInTab(tabId) {
+  if (!tabId) return;
+  chrome.tabs.sendMessage(tabId, { action: "ping" }, (response) => {
+    const err = chrome.runtime.lastError?.message || "";
+    if (err.includes("Receiving end does not exist") || err.includes("Could not establish connection")) {
+      injectContentScriptIntoTab(tabId);
+    }
+  });
+}
+
+// On install/update: inject content scripts into all existing Dailymotion tabs so the download button appears without refresh
+chrome.runtime.onInstalled.addListener((details) => {
+  if (!chrome.scripting || !chrome.scripting.executeScript) return;
+  chrome.tabs.query({ url: "*://*.dailymotion.com/*" }, (tabs) => {
+    tabs.forEach((tab) => {
+      if (tab.id) injectContentScriptIntoTab(tab.id);
+    });
+    if (tabs.length > 0) {
+      console.log("[DM Downloader] Injected content scripts into", tabs.length, "existing Dailymotion tab(s)");
+    }
+  });
+});
+
 // Clean up on service worker suspend (when extension is disabled/removed)
 if (chrome.runtime.onSuspend) {
   chrome.runtime.onSuspend.addListener(() => {
@@ -1160,6 +1234,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
     console.log("Sending video data for tabId:", tabId, "(current video only, URLs:", data.urls.length, ")");
     sendResponse({ videoData: data });
+    // If popup is showing a video but the page never got the content script (e.g. tab was open before install), inject now
+    if (tabId && data.urls.length > 0) {
+      ensureContentScriptInTab(tabId);
+    }
   } else if (request.action === "getDownloadInfo") {
     // Return download info for a specific download ID
     // First check in-memory Map, then try storage (for persistence across service worker restarts)
