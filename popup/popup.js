@@ -473,15 +473,14 @@ function displayVideos(videoData) {
       return false;
     }
     // Hide any HLS URL that doesn't have a specific quality (hls-240p, hls-360p, etc.)
-    // These are either master playlists or unparsed HLS streams
+    // These are either master playlists or unparsed HLS streams. Allow hls-audio / hls-audio-*.
     if (v.type && isHLS(v.type)) {
-      // Using utility function
-      // Check if this HLS URL has quality info in its type (using utility function)
+      if (v.type === "hls-audio" || (v.type && v.type.startsWith("hls-audio-"))) {
+        return true; // Show audio tracks from EXT-X-MEDIA TYPE=AUDIO
+      }
       const quality = extractQuality(v.type, v.url);
       const hasQualityInType = quality !== null;
       if (!hasQualityInType) {
-        // No quality info - hide it completely
-        // This includes master playlists and any unparsed HLS streams
         return false;
       }
     }
@@ -1093,6 +1092,10 @@ function parseConfigFile(configUrl) {
 }
 
 function extractQuality(type, url = "") {
+  // Audio tracks (no pixel quality) - return 0 so they sort last in quality list
+  if (type && (type === "hls-audio" || type.startsWith("hls-audio-"))) {
+    return 0;
+  }
   // Try to extract from type first (e.g., "mp4-1080p", "hls-1080p", "hls-720p")
   let match = type.match(/(\d+)p/i);
   if (match) {
@@ -1134,6 +1137,9 @@ function extractQuality(type, url = "") {
 }
 
 function formatTypeLabel(type) {
+  if (type && (type === "hls-audio" || type.startsWith("hls-audio-"))) {
+    return "Audio";
+  }
   if (type.includes("mp4")) {
     return type.toUpperCase();
   } else if (type.includes("m3u8") || type.includes("hls")) {
@@ -1164,16 +1170,17 @@ function downloadVideo(
   };
 
   const sanitizedTitle = sanitizeFilename(videoTitle);
-  const extension = getExtension(url);
+  const isAudio = type === "hls-audio" || (type && type.startsWith("hls-audio-"));
+  const extension = isAudio ? "m4a" : getExtension(url);
 
   // Include quality in filename if available
   let filename;
   if (qualityLabel && qualityLabel.trim()) {
-    // Extract just the quality part (e.g., "1080p" from "1080p (HLS)" or "1080p (MP4)")
-    const qualityMatch = qualityLabel.match(/(\d+p)/i);
-    const qualityPart = qualityMatch
-      ? qualityMatch[1]
-      : qualityLabel.split(" ")[0];
+    // For audio, use "Audio" as the part; for video use quality (e.g. 1080p)
+    const qualityPart = isAudio
+      ? "Audio"
+      : (qualityLabel.match(/(\d+p)/i) && qualityLabel.match(/(\d+p)/i)[1]) ||
+        qualityLabel.split(" ")[0];
     filename = `${sanitizedTitle} - ${qualityPart}.${extension}`;
   } else {
     filename = `${sanitizedTitle}.${extension}`;

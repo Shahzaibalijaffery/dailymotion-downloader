@@ -242,6 +242,51 @@ function parseMasterPlaylist(playlistText, baseUrl) {
 }
 
 /**
+ * Parse master playlist for EXT-X-MEDIA TYPE=AUDIO (alternate/audio-only tracks).
+ * @param {string} playlistText - The master playlist text
+ * @param {string} baseUrl - Base URL for resolving relative URIs
+ * @returns {Array<{ url: string, name: string }>}
+ */
+function parseMasterPlaylistAudio(playlistText, baseUrl) {
+  const lines = playlistText.split("\n");
+  const audioTracks = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (!line.startsWith("#EXT-X-MEDIA:")) continue;
+
+    const typeMatch = line.match(/TYPE=([^,]+)/i);
+    if (!typeMatch || typeMatch[1].toUpperCase() !== "AUDIO") continue;
+
+    const uriMatch = line.match(/URI="([^"]+)"/) || line.match(/URI='([^']+)'/);
+    if (!uriMatch || !uriMatch[1]) continue;
+
+    const nameMatch =
+      line.match(/NAME="([^"]+)"/) || line.match(/NAME='([^']+)'/);
+    const name = nameMatch ? nameMatch[1] : "Audio";
+
+    let trackUrl;
+    const uri = uriMatch[1].trim();
+    if (uri.startsWith("http://") || uri.startsWith("https://")) {
+      trackUrl = uri;
+    } else if (uri.startsWith("/")) {
+      try {
+        const urlObj = new URL(baseUrl);
+        trackUrl = `${urlObj.protocol}//${urlObj.host}${uri}`;
+      } catch (e) {
+        continue;
+      }
+    } else {
+      trackUrl = baseUrl + uri;
+    }
+
+    audioTracks.push({ url: trackUrl, name });
+  }
+
+  return audioTracks;
+}
+
+/**
  * Download and merge M3U8 playlist segments into a single video file
  * @param {string} m3u8Url - The M3U8 playlist URL
  * @param {string} filename - The filename for the final video
@@ -269,9 +314,10 @@ async function downloadViaStreamFromChunks(
   cleanupIndexedDBBlob,
 ) {
   const { blobId, chunkCount, totalSize } = chunksOnlyForDownload;
-  const sanitized = typeof sanitizeFilenameForDownload === "function"
-    ? sanitizeFilenameForDownload(filename)
-    : filename.replace(/[\\/:*?"<>|]/g, "_");
+  const sanitized =
+    typeof sanitizeFilenameForDownload === "function"
+      ? sanitizeFilenameForDownload(filename)
+      : filename.replace(/[\\/:*?"<>|]/g, "_");
   const streamUrl =
     chrome.runtime.getURL("stream") +
     "?" +
@@ -295,7 +341,9 @@ async function downloadViaStreamFromChunks(
       },
       (chromeDownloadId) => {
         if (chrome.runtime.lastError || chromeDownloadId === undefined) {
-          reject(new Error(chrome.runtime.lastError?.message || "Download failed"));
+          reject(
+            new Error(chrome.runtime.lastError?.message || "Download failed"),
+          );
           return;
         }
         activeChromeDownloads.set(chromeDownloadId, {
@@ -342,15 +390,17 @@ async function downloadViaBlobFromChunks(
   setupOffscreenDocument,
 ) {
   const { blobId, chunkCount } = chunksOnlyForDownload;
-  const sanitized = typeof sanitizeFilenameForDownload === "function"
-    ? sanitizeFilenameForDownload(filename)
-    : filename.replace(/[\\/:*?"<>|]/g, "_");
+  const sanitized =
+    typeof sanitizeFilenameForDownload === "function"
+      ? sanitizeFilenameForDownload(filename)
+      : filename.replace(/[\\/:*?"<>|]/g, "_");
   await setupOffscreenDocument();
   const buildResult = await new Promise((resolve) => {
     chrome.runtime.sendMessage(
       { action: "buildBlobFromChunksForDownload", blobId, chunkCount },
       (response) => {
-        if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
+        if (chrome.runtime.lastError)
+          resolve({ success: false, error: chrome.runtime.lastError.message });
         else resolve(response || { success: false, error: "No response" });
       },
     );
@@ -364,7 +414,12 @@ async function downloadViaBlobFromChunks(
   return new Promise((resolve, reject) => {
     const controllerInfo = downloadControllers.get(downloadId);
     if (controllerInfo?.controller.signal.aborted) {
-      try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
+      try {
+        chrome.runtime.sendMessage(
+          { action: "revokeBlobUrl", blobUrl },
+          () => {},
+        );
+      } catch (e) {}
       reject(new Error("Download cancelled"));
       return;
     }
@@ -372,8 +427,15 @@ async function downloadViaBlobFromChunks(
       { url: blobUrl, filename: sanitized, saveAs: false },
       (chromeDownloadId) => {
         if (chrome.runtime.lastError || chromeDownloadId === undefined) {
-          try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
-          reject(new Error(chrome.runtime.lastError?.message || "Download failed"));
+          try {
+            chrome.runtime.sendMessage(
+              { action: "revokeBlobUrl", blobUrl },
+              () => {},
+            );
+          } catch (e) {}
+          reject(
+            new Error(chrome.runtime.lastError?.message || "Download failed"),
+          );
           return;
         }
         activeChromeDownloads.set(chromeDownloadId, {
@@ -384,7 +446,12 @@ async function downloadViaBlobFromChunks(
         });
         if (controllerInfo) controllerInfo.chromeDownloadId = chromeDownloadId;
         const revokeWhenDone = () => {
-          try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
+          try {
+            chrome.runtime.sendMessage(
+              { action: "revokeBlobUrl", blobUrl },
+              () => {},
+            );
+          } catch (e) {}
         };
         const poll = () => {
           chrome.downloads.search({ id: chromeDownloadId }, (results) => {
@@ -433,9 +500,10 @@ async function downloadViaChunkedMp4Conversion(
     throw new Error("No parts to convert");
   }
   const baseName = finalFilename.replace(/\.ts$/i, "").trim();
-  const sanitize = typeof sanitizeFilenameForDownload === "function"
-    ? sanitizeFilenameForDownload
-    : (s) => s.replace(/[\\/:*?"<>|]/g, "_");
+  const sanitize =
+    typeof sanitizeFilenameForDownload === "function"
+      ? sanitizeFilenameForDownload
+      : (s) => s.replace(/[\\/:*?"<>|]/g, "_");
 
   await setupOffscreenDocument();
 
@@ -482,7 +550,12 @@ async function downloadViaChunkedMp4Conversion(
     await new Promise((resolve, reject) => {
       const blobUrl = convertResult.blobUrl;
       if (controllerInfoPart?.controller.signal.aborted) {
-        try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
+        try {
+          chrome.runtime.sendMessage(
+            { action: "revokeBlobUrl", blobUrl },
+            () => {},
+          );
+        } catch (e) {}
         reject(new Error("Download cancelled"));
         return;
       }
@@ -490,8 +563,15 @@ async function downloadViaChunkedMp4Conversion(
         { url: blobUrl, filename: partFilename, saveAs: false },
         (chromeDownloadId) => {
           if (chrome.runtime.lastError || chromeDownloadId === undefined) {
-            try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
-            reject(new Error(chrome.runtime.lastError?.message || "Download failed"));
+            try {
+              chrome.runtime.sendMessage(
+                { action: "revokeBlobUrl", blobUrl },
+                () => {},
+              );
+            } catch (e) {}
+            reject(
+              new Error(chrome.runtime.lastError?.message || "Download failed"),
+            );
             return;
           }
           activeChromeDownloads.set(chromeDownloadId, {
@@ -501,7 +581,12 @@ async function downloadViaChunkedMp4Conversion(
             filename: partFilename,
           });
           const revokeWhenDone = () => {
-            try { chrome.runtime.sendMessage({ action: "revokeBlobUrl", blobUrl }, () => {}); } catch (e) {}
+            try {
+              chrome.runtime.sendMessage(
+                { action: "revokeBlobUrl", blobUrl },
+                () => {},
+              );
+            } catch (e) {}
           };
           const poll = () => {
             chrome.downloads.search({ id: chromeDownloadId }, (results) => {
@@ -533,8 +618,10 @@ async function downloadViaChunkedMp4Conversion(
     chrome.runtime.sendMessage(
       { action: "deleteChunksForBlob", blobId, chunkCount },
       (response) => {
-        if (chrome.runtime.lastError) reject(new Error(chrome.runtime.lastError.message));
-        else if (response && !response.success) reject(new Error(response.error || "Cleanup failed"));
+        if (chrome.runtime.lastError)
+          reject(new Error(chrome.runtime.lastError.message));
+        else if (response && !response.success)
+          reject(new Error(response.error || "Cleanup failed"));
         else resolve();
       },
     );
@@ -1821,22 +1908,43 @@ async function downloadAndMergeM3U8(
       await setupOffscreenDocument();
       // Avoid creating one 2GB+ merged blob — write segment blobs directly to IDB (each ~40MB read).
       if (finalFilename.includes(".m3u8")) {
-        finalFilename = isMPEGTS ? finalFilename.replace(/\.m3u8$/i, ".ts") : finalFilename.replace(/\.m3u8$/i, ".mp4");
-        finalFilename = finalFilename.replace(/\.m3u8\./i, isMPEGTS ? ".ts." : ".mp4.");
+        finalFilename = isMPEGTS
+          ? finalFilename.replace(/\.m3u8$/i, ".ts")
+          : finalFilename.replace(/\.m3u8$/i, ".mp4");
+        finalFilename = finalFilename.replace(
+          /\.m3u8\./i,
+          isMPEGTS ? ".ts." : ".mp4.",
+        );
       } else if (!finalFilename.match(/\.(mp4|ts|mpegts|mkv|webm)$/i)) {
-        finalFilename = finalFilename.replace(/\.[^.]*$/, "") + (isMPEGTS ? ".ts" : ".mp4");
+        finalFilename =
+          finalFilename.replace(/\.[^.]*$/, "") + (isMPEGTS ? ".ts" : ".mp4");
       }
       console.log(
-        `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"}) — large file (${Math.round(totalSizeFromBlobs / 1024 / 1024)}MB), writing segment batches to IDB directly`,
+        `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"}) — large file (${Math.round(
+          totalSizeFromBlobs / 1024 / 1024,
+        )}MB), writing segment batches to IDB directly`,
       );
-      const header = new Uint8Array(await finalBlobs[0].slice(0, 8).arrayBuffer());
+      const header = new Uint8Array(
+        await finalBlobs[0].slice(0, 8).arrayBuffer(),
+      );
       if (isMPEGTS && header[0] === 0x47) {
-        console.log("✅ MPEG-TS structure (sync byte 0x47) — should play in VLC and most players");
+        console.log(
+          "✅ MPEG-TS structure (sync byte 0x47) — should play in VLC and most players",
+        );
       } else if (!isMPEGTS) {
-        const hasFtyp = header[4] === 0x66 && header[5] === 0x74 && header[6] === 0x79 && header[7] === 0x70;
-        if (!hasFtyp) throw new Error("Merged file does not have valid MP4 structure (missing ftyp box).");
+        const hasFtyp =
+          header[4] === 0x66 &&
+          header[5] === 0x74 &&
+          header[6] === 0x79 &&
+          header[7] === 0x70;
+        if (!hasFtyp)
+          throw new Error(
+            "Merged file does not have valid MP4 structure (missing ftyp box).",
+          );
       }
-      inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+      inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random()
+        .toString(36)
+        .slice(2, 9)}`;
       const db = await new Promise((resolve, reject) => {
         const req = indexedDB.open("DailymotionDownloaderDB", 1);
         req.onerror = () => reject(req.error);
@@ -1851,7 +1959,10 @@ async function downloadAndMergeM3U8(
         const buf = await finalBlobs[i].arrayBuffer();
         await new Promise((resolve, reject) => {
           const tx = db.transaction(["blobs"], "readwrite");
-          tx.objectStore("blobs").put(buf, `${inputBlobIdForConvert}_chunk_${i}`);
+          tx.objectStore("blobs").put(
+            buf,
+            `${inputBlobIdForConvert}_chunk_${i}`,
+          );
           tx.oncomplete = () => resolve();
           tx.onerror = () => reject(tx.error);
         });
@@ -1883,112 +1994,114 @@ async function downloadAndMergeM3U8(
     }
 
     if (!isLargeFile) {
-    // Create final blob from all blobs
-    // Use appropriate MIME type: MPEG-TS uses 'video/mp2t', fMP4 uses 'video/mp4'
-    const finalMimeType = isMPEGTS ? "video/mp2t" : "video/mp4";
-    let mergedBlob = new Blob(finalBlobs, { type: finalMimeType });
+      // Create final blob from all blobs
+      // Use appropriate MIME type: MPEG-TS uses 'video/mp2t', fMP4 uses 'video/mp4'
+      const finalMimeType = isMPEGTS ? "video/mp2t" : "video/mp4";
+      let mergedBlob = new Blob(finalBlobs, { type: finalMimeType });
 
-    // Free segment/final arrays BEFORE mergedBlob.arrayBuffer() to avoid NotReadableError on large files.
-    // We only need mergedBlob from here; the next line reads it and needs memory headroom.
-    segmentData.length = 0;
-    if (orderedSegments && orderedSegments.length) orderedSegments.length = 0;
-    if (segmentBuffers && segmentBuffers.length) segmentBuffers.length = 0;
-    segmentBlobs.length = 0;
-    finalBlobs.length = 0;
+      // Free segment/final arrays BEFORE mergedBlob.arrayBuffer() to avoid NotReadableError on large files.
+      // We only need mergedBlob from here; the next line reads it and needs memory headroom.
+      segmentData.length = 0;
+      if (orderedSegments && orderedSegments.length) orderedSegments.length = 0;
+      if (segmentBuffers && segmentBuffers.length) segmentBuffers.length = 0;
+      segmentBlobs.length = 0;
+      finalBlobs.length = 0;
 
-    // Update filename extension based on format
-    finalFilename = filename || "dailymotion_video.mp4";
-    if (finalFilename.includes(".m3u8")) {
-      // Replace .m3u8 with appropriate extension
-      if (isMPEGTS) {
-        finalFilename = finalFilename.replace(/\.m3u8$/i, ".ts");
-        // Also replace if extension is in the middle of filename
-        finalFilename = finalFilename.replace(/\.m3u8\./i, ".ts.");
-      } else {
-        finalFilename = finalFilename.replace(/\.m3u8$/i, ".mp4");
-        // Also replace if extension is in the middle of filename
-        finalFilename = finalFilename.replace(/\.m3u8\./i, ".mp4.");
-      }
-    } else if (!finalFilename.match(/\.(mp4|ts|mpegts|mkv|webm)$/i)) {
-      // If no video extension, add one based on format
-      if (isMPEGTS) {
-        finalFilename = finalFilename.replace(/\.[^.]*$/, "") + ".ts";
-      } else {
-        finalFilename = finalFilename.replace(/\.[^.]*$/, "") + ".mp4";
-      }
-    }
-
-    console.log(
-      `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"})`,
-    );
-
-    // Validate final blob size
-    if (mergedBlob.size === 0) {
-      throw new Error("Merged video file is empty. Download failed.");
-    }
-    if (mergedBlob.size < 8) {
-      throw new Error("Merged video file is too small. Download failed.");
-    }
-
-    // Validate file structure by reading ONLY the first 8 bytes (avoids NotReadableError on large files).
-    // Full mergedBlob.arrayBuffer() would duplicate the entire video in memory and hit limits.
-    const header = new Uint8Array(await mergedBlob.slice(0, 8).arrayBuffer());
-    validatedBlob = mergedBlob;
-
-    if (isMPEGTS) {
-      // MPEG-TS validation: Check for sync byte (0x47) at the start
-      const hasSyncByte = header[0] === 0x47;
-      if (hasSyncByte) {
-        console.log(
-          "✅ Merged file has valid MPEG-TS structure (sync byte 0x47 found) - should play in VLC and most players",
-        );
-      } else {
-        console.warn(
-          "⚠️ MPEG-TS file does not start with sync byte 0x47 - may still play but structure might be invalid",
-        );
-      }
-      // Use mergedBlob as-is; no need to recreate from full array
-    } else {
-      // fMP4 validation: Check if file starts with proper MP4 structure (ftyp at offset 4)
-      const mergedHasFtyp =
-        header[4] === 0x66 &&
-        header[5] === 0x74 &&
-        header[6] === 0x79 &&
-        header[7] === 0x70;
-
-      if (!mergedHasFtyp) {
-        const errorMsg =
-          "Merged file does not have valid MP4 structure (missing ftyp box). File will not play in QuickTime Player.";
-        console.error(errorMsg);
-        await chrome.storage.local.set({
-          [`downloadProgress_${downloadId}`]: 0,
-          [`downloadStatus_${downloadId}`]: errorMsg,
-        });
-        throw new Error(errorMsg);
+      // Update filename extension based on format
+      finalFilename = filename || "dailymotion_video.mp4";
+      if (finalFilename.includes(".m3u8")) {
+        // Replace .m3u8 with appropriate extension
+        if (isMPEGTS) {
+          finalFilename = finalFilename.replace(/\.m3u8$/i, ".ts");
+          // Also replace if extension is in the middle of filename
+          finalFilename = finalFilename.replace(/\.m3u8\./i, ".ts.");
+        } else {
+          finalFilename = finalFilename.replace(/\.m3u8$/i, ".mp4");
+          // Also replace if extension is in the middle of filename
+          finalFilename = finalFilename.replace(/\.m3u8\./i, ".mp4.");
+        }
+      } else if (!finalFilename.match(/\.(mp4|ts|mpegts|mkv|webm)$/i)) {
+        // If no video extension, add one based on format
+        if (isMPEGTS) {
+          finalFilename = finalFilename.replace(/\.[^.]*$/, "") + ".ts";
+        } else {
+          finalFilename = finalFilename.replace(/\.[^.]*$/, "") + ".mp4";
+        }
       }
 
       console.log(
-        "✅ Merged file has valid MP4 structure - should play in QuickTime and VLC",
+        `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"})`,
       );
-      // Use mergedBlob as-is; no need to recreate from full array
-    }
+
+      // Validate final blob size
+      if (mergedBlob.size === 0) {
+        throw new Error("Merged video file is empty. Download failed.");
+      }
+      if (mergedBlob.size < 8) {
+        throw new Error("Merged video file is too small. Download failed.");
+      }
+
+      // Validate file structure by reading ONLY the first 8 bytes (avoids NotReadableError on large files).
+      // Full mergedBlob.arrayBuffer() would duplicate the entire video in memory and hit limits.
+      const header = new Uint8Array(await mergedBlob.slice(0, 8).arrayBuffer());
+      validatedBlob = mergedBlob;
+
+      if (isMPEGTS) {
+        // MPEG-TS validation: Check for sync byte (0x47) at the start
+        const hasSyncByte = header[0] === 0x47;
+        if (hasSyncByte) {
+          console.log(
+            "✅ Merged file has valid MPEG-TS structure (sync byte 0x47 found) - should play in VLC and most players",
+          );
+        } else {
+          console.warn(
+            "⚠️ MPEG-TS file does not start with sync byte 0x47 - may still play but structure might be invalid",
+          );
+        }
+        // Use mergedBlob as-is; no need to recreate from full array
+      } else {
+        // fMP4 validation: Check if file starts with proper MP4 structure (ftyp at offset 4)
+        const mergedHasFtyp =
+          header[4] === 0x66 &&
+          header[5] === 0x74 &&
+          header[6] === 0x79 &&
+          header[7] === 0x70;
+
+        if (!mergedHasFtyp) {
+          const errorMsg =
+            "Merged file does not have valid MP4 structure (missing ftyp box). File will not play in QuickTime Player.";
+          console.error(errorMsg);
+          await chrome.storage.local.set({
+            [`downloadProgress_${downloadId}`]: 0,
+            [`downloadStatus_${downloadId}`]: errorMsg,
+          });
+          throw new Error(errorMsg);
+        }
+
+        console.log(
+          "✅ Merged file has valid MP4 structure - should play in QuickTime and VLC",
+        );
+        // Use mergedBlob as-is; no need to recreate from full array
+      }
     } // end if (!isLargeFile)
 
-    const sizeMB = Math.round((validatedBlob ? validatedBlob.size : totalSizeFromBlobs) / (1024 * 1024));
+    const sizeMB = Math.round(
+      (validatedBlob ? validatedBlob.size : totalSizeFromBlobs) / (1024 * 1024),
+    );
     console.log(`Total merged size: ${sizeMB}MB`);
 
     // Warn about potential playback issues
     if (missingIndices.length > 0) {
       console.warn(
-        `⚠️ HLS segments merged with ${missingIndices.length} missing segments - file may have playback issues. Prefer MP4 downloads when available.`,
+        `⚠️ HLS segments merged with ${missingIndices.length} missing segments - file may have playback issues.`,
       );
     } else {
       console.log(
-        "✅ All segments downloaded successfully - video should play correctly in QuickTime and VLC",
+        "✅ All segments downloaded successfully - video should play correctly in common players",
       );
     }
 
-    // Free merge-phase memory before conversion/download
+    // Free merge-phase memory before download
     segmentData.length = 0;
     if (orderedSegments && orderedSegments.length) orderedSegments.length = 0;
     if (segmentBuffers && segmentBuffers.length) segmentBuffers.length = 0;
@@ -2072,7 +2185,7 @@ async function downloadAndMergeM3U8(
         throw new Error(assembleResult?.error || "Failed to assemble chunks in IDB");
       }
       storedInputInIDB = true;
-      // FFmpeg check (same idea as sound-catcher): ensure FFmpeg is loadable before starting conversion
+      // FFmpeg check: ensure FFmpeg is loadable before starting conversion
       const checkResult = await new Promise((resolve) => {
         chrome.runtime.sendMessage({ action: "checkFFmpeg" }, (response) => {
           if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
@@ -2121,19 +2234,19 @@ async function downloadAndMergeM3U8(
           setupOffscreenDocument,
           blobToDataUrl,
         );
+        cleanupIndexedDBBlob(convertResult.outputBlobId);
       }
     } catch (convertErr) {
-      console.warn("Convert to MP4 failed, saving as .ts:", convertErr.message);
+      console.warn("Convert to MP4 failed, saving as .ts:", convertErr?.message || convertErr);
     }
 
     if (!converted) {
       let fallbackStatus = "Download complete! (saved as .ts)";
       await chrome.storage.local.set({
         [`downloadProgress_${downloadId}`]: 100,
-        [`downloadStatus_${downloadId}`]: "Saving as .ts (conversion failed or timed out)...",
+        [`downloadStatus_${downloadId}`]:
+          "Saving as .ts (conversion failed or timed out)...",
       });
-      // Use IDB for .ts fallback when we stored the merged blob there: validatedBlob is no longer
-      // readable after arrayBuffer() and would throw NotReadableError if used again.
       if (storedInputInIDB && inputBlobIdForConvert) {
         console.log("[downloadM3U8] .ts fallback: using IDB blob", inputBlobIdForConvert);
         await downloadBlob(
@@ -2148,7 +2261,6 @@ async function downloadAndMergeM3U8(
         );
         cleanupIndexedDBBlob(inputBlobIdForConvert);
       } else if (chunksOnlyForDownload) {
-        // Try chunked MP4 conversion (500MB parts) so we get part1.mp4, part2.mp4, ... instead of one huge .ts
         try {
           console.log("[downloadM3U8] Trying chunked MP4 conversion (500MB parts)...");
           await downloadViaChunkedMp4Conversion(
@@ -2163,7 +2275,8 @@ async function downloadAndMergeM3U8(
         } catch (chunkedErr) {
           console.warn("[downloadM3U8] Chunked MP4 failed, saving as single .ts:", chunkedErr.message);
           await chrome.storage.local.set({
-            [`downloadStatus_${downloadId}`]: "Saving as .ts (conversion failed or timed out)...",
+            [`downloadStatus_${downloadId}`]:
+              "Saving as .ts (conversion failed or timed out)...",
           });
           await downloadViaBlobFromChunks(
             chunksOnlyForDownload,
@@ -2522,9 +2635,15 @@ async function parseAndStoreHLSVariants(
     const playlistText = await response.text();
     console.log("Master playlist fetched, length:", playlistText.length);
 
-    if (!playlistText || !playlistText.includes("#EXT-X-STREAM-INF")) {
-      // Not a master playlist, or already a variant playlist
-      console.log("Not a master playlist or no #EXT-X-STREAM-INF found");
+    const hasVideoVariants =
+      playlistText && playlistText.includes("#EXT-X-STREAM-INF");
+    const hasAudioMedia =
+      playlistText && /#EXT-X-MEDIA:.*TYPE=AUDIO/i.test(playlistText);
+
+    if (!hasVideoVariants && !hasAudioMedia) {
+      console.log(
+        "Not a master playlist (no EXT-X-STREAM-INF or EXT-X-MEDIA TYPE=AUDIO)",
+      );
       return;
     }
 
@@ -2534,19 +2653,35 @@ async function parseAndStoreHLSVariants(
       masterPlaylistUrl.lastIndexOf("/") + 1,
     );
 
-    // Parse variants from master playlist
-    const variants = parseMasterPlaylist(playlistText, baseUrl);
-    console.log(
-      `Found ${variants.length} HLS variants:`,
-      variants.map((v) => ({
-        resolution: v.resolution,
-        bandwidth: v.bandwidth,
-        url: v.url.substring(0, 60) + "...",
-      })),
-    );
+    const variants = hasVideoVariants
+      ? parseMasterPlaylist(playlistText, baseUrl)
+      : [];
+    const audioTracks = hasAudioMedia
+      ? parseMasterPlaylistAudio(playlistText, baseUrl)
+      : [];
 
-    if (variants.length === 0) {
-      console.log("No variants found in master playlist");
+    if (variants.length > 0) {
+      console.log(
+        `Found ${variants.length} HLS variants:`,
+        variants.map((v) => ({
+          resolution: v.resolution,
+          bandwidth: v.bandwidth,
+          url: v.url.substring(0, 60) + "...",
+        })),
+      );
+    }
+    if (audioTracks.length > 0) {
+      console.log(
+        `Found ${audioTracks.length} audio track(s):`,
+        audioTracks.map((a) => ({
+          name: a.name,
+          url: a.url.substring(0, 60) + "...",
+        })),
+      );
+    }
+
+    if (variants.length === 0 && audioTracks.length === 0) {
+      console.log("No video variants or audio tracks found in master playlist");
       return;
     }
 
@@ -2687,7 +2822,7 @@ async function parseAndStoreHLSVariants(
       );
     }
 
-    // Store each variant with quality information
+    // Store each video variant with quality information
     let storedCount = 0;
     variants.forEach((variant, index) => {
       // Extract quality from resolution (e.g., "1920x1080" -> "1080p")
@@ -2721,8 +2856,21 @@ async function parseAndStoreHLSVariants(
       );
     });
 
+    // Store each audio track (EXT-X-MEDIA TYPE=AUDIO)
+    audioTracks.forEach((track, index) => {
+      const type =
+        audioTracks.length > 1
+          ? `hls-audio-${track.name.replace(/\s+/g, "_")}`
+          : "hls-audio";
+      storeVideoUrl(tabId, track.url, type, false, videoTitle, videoId);
+      storedCount++;
+      console.log(
+        `Stored HLS audio ${index + 1}/${audioTracks.length}: ${track.name} (videoId: ${videoId}) - ${track.url.substring(0, 80)}...`,
+      );
+    });
+
     console.log(
-      `Successfully stored ${storedCount} HLS variants for tab ${tabId}`,
+      `Successfully stored ${storedCount} HLS variant(s) and audio for tab ${tabId}`,
     );
   } catch (error) {
     console.error("Failed to parse HLS master playlist for variants:", error);

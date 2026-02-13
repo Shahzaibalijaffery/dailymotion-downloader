@@ -34,6 +34,16 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
+    if (request.action === "checkFFmpeg") {
+      ensureFFmpegReady()
+        .then(() => sendResponse({ success: true }))
+        .catch((err) => {
+          console.warn("checkFFmpeg failed:", err);
+          sendResponse({ success: false, error: err.message });
+        });
+      return true;
+    }
+
     if (request.action === "revokeBlobUrl" && request.blobUrl) {
       try {
         URL.revokeObjectURL(request.blobUrl);
@@ -42,16 +52,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
         console.warn("revokeBlobUrl failed:", e);
       }
       sendResponse({ success: true });
-      return true;
-    }
-
-    if (request.action === "checkFFmpeg") {
-      ensureFFmpegReady()
-        .then(() => sendResponse({ success: true }))
-        .catch((err) => {
-          console.warn("checkFFmpeg failed:", err);
-          sendResponse({ success: false, error: err.message });
-        });
       return true;
     }
 
@@ -111,7 +111,10 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     if (request.action === "assembleChunksForConvert") {
       const { blobId, chunkCount, totalSize } = request;
       if (!blobId || chunkCount == null || !totalSize) {
-        sendResponse({ success: false, error: "Missing blobId, chunkCount or totalSize" });
+        sendResponse({
+          success: false,
+          error: "Missing blobId, chunkCount or totalSize",
+        });
         return true;
       }
       (async () => {
@@ -200,19 +203,15 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     if (request.action === "convertToMp4") {
-      handleConvertToMp4(
-        request.blobId,
-        request.downloadId,
-        (progress) => {
-          try {
-            chrome.runtime.sendMessage({
-              action: "convertProgress",
-              downloadId: request.downloadId,
-              progress,
-            });
-          } catch (e) {}
-        },
-      )
+      handleConvertToMp4(request.blobId, request.downloadId, (progress) => {
+        try {
+          chrome.runtime.sendMessage({
+            action: "convertProgress",
+            downloadId: request.downloadId,
+            progress,
+          });
+        } catch (e) {}
+      })
         .then((result) => sendResponse(result))
         .catch((err) => {
           console.error("convertToMp4 error:", err);
@@ -315,16 +314,19 @@ console.log("✅ Message listener set up successfully!");
 const ffmpegAvailable = FFmpegClass !== null;
 console.log("Sending offscreenReady signal to background script...");
 try {
-  chrome.runtime.sendMessage({ action: "offscreenReady", ffmpegAvailable }, (response) => {
-    if (chrome.runtime.lastError) {
-      console.warn(
-        "❌ Error sending offscreenReady:",
-        chrome.runtime.lastError.message,
-      );
-    } else {
-      console.log("✅ Offscreen document ready signal sent successfully!");
-    }
-  });
+  chrome.runtime.sendMessage(
+    { action: "offscreenReady", ffmpegAvailable },
+    (response) => {
+      if (chrome.runtime.lastError) {
+        console.warn(
+          "❌ Error sending offscreenReady:",
+          chrome.runtime.lastError.message,
+        );
+      } else {
+        console.log("✅ Offscreen document ready signal sent successfully!");
+      }
+    },
+  );
 } catch (error) {
   console.error("❌ Error sending offscreenReady:", error);
 }
@@ -407,7 +409,9 @@ let ffmpegLoadPromise = null;
 
 async function getFFmpeg() {
   if (!FFmpegClass) {
-    throw new Error("FFmpeg (ffmpeg.wasm) not loaded. Check offscreen script order.");
+    throw new Error(
+      "FFmpeg (ffmpeg.wasm) not loaded. Check offscreen script order.",
+    );
   }
   if (ffmpegInstance) return ffmpegInstance;
   if (ffmpegLoadPromise) return ffmpegLoadPromise;
@@ -521,7 +525,13 @@ const TS_PACKET_SIZE = 188;
  * at most partSizeBytes (default 500MB), aligns to TS packet boundary, runs FFmpeg, returns blob URL.
  * Supports variable-size chunks (large-file path uses one chunk per segment batch, not fixed 32MB).
  */
-async function handleConvertPartToMp4(blobId, chunkCount, totalSize, partIndex, partSizeBytes) {
+async function handleConvertPartToMp4(
+  blobId,
+  chunkCount,
+  totalSize,
+  partIndex,
+  partSizeBytes,
+) {
   partSizeBytes = partSizeBytes || 500 * 1024 * 1024;
   const startByte = partIndex * partSizeBytes;
   let endByte = Math.min(startByte + partSizeBytes, totalSize);

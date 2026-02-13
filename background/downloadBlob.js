@@ -335,16 +335,16 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
               let stuckTimeout = null;
               let verificationInterval = null;
               
-              // If saveAs is true and download gets stuck, retry with saveAs: false
+              // If saveAs is true and download gets stuck, retry with saveAs: false only after user had plenty of time
               if (useSaveAs) {
                 stuckTimeout = setTimeout(() => {
                   if (!isResolved && !hasRetried) {
-                    console.log('[downloadBlob] Download stuck with saveAs dialog, retrying with saveAs: false');
+                    console.log('[downloadBlob] Save As dialog open a long time, checking if we should retry without dialog');
                     chrome.downloads.search({ id: chromeDownloadId }, (checkResults) => {
                       if (checkResults && checkResults.length > 0) {
                         const state = checkResults[0].state;
                         const bytesReceived = checkResults[0].bytesReceived || 0;
-                        // Only retry if still in progress and hasn't progressed much
+                        // Only retry if still in progress and hasn't progressed much (user may still be choosing folder)
                         if (state === 'in_progress' && bytesReceived < 1024 * 1024) {
                           hasRetried = true;
                           downloadStarted = false;
@@ -359,7 +359,7 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                       }
                     });
                   }
-                }, 5000); // Wait 5 seconds for user to interact with dialog
+                }, 90000); // 90 seconds: give user time to respond to Save As dialog before considering stuck
               }
               
               // Immediately check download state (might complete instantly)
@@ -466,8 +466,9 @@ async function downloadBlob(blob, filename, downloadId, downloadControllers, act
                       }
                     } else {
                       noProgressCount++;
-                      // If saveAs was true and download is stuck, retry with saveAs: false
-                      if (useSaveAs && !hasRetried && noProgressCount > 10) {
+                      // If saveAs was true and download is stuck, retry with saveAs: false (allow ~60s for user to pick location)
+                      const stuckThreshold = useSaveAs ? 120 : 10; // 120 * 500ms = 60s when Save As dialog is open
+                      if (useSaveAs && !hasRetried && noProgressCount > stuckThreshold) {
                         console.log('[downloadBlob] Download stuck with saveAs, retrying with saveAs: false');
                         hasRetried = true;
                         downloadStarted = false;

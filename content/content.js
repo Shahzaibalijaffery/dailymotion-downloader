@@ -169,7 +169,35 @@ if (document.readyState === 'loading') {
 // Listen for messages from background script to handle blob downloads and download notifications
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   console.log('Content script received message:', request.action, request);
-  
+
+  // So background can detect that content script is loaded (e.g. before injecting into tab)
+  if (request.action === 'ping') {
+    sendResponse({ pong: true });
+    return false;
+  }
+
+  // Background asks to (re)inject the download button (e.g. after programmatic inject so button shows without refresh)
+  if (request.action === 'requestInjectButton') {
+    try {
+      // Trigger extraction first so background has fresh video data, then inject button
+      if (typeof scheduleExtract === 'function') {
+        scheduleExtract('requestInjectButton');
+      } else if (typeof extractVideoConfig === 'function') {
+        extractVideoConfig('requestInjectButton');
+      }
+      setTimeout(() => {
+        if (typeof injectDownloadButton === 'function') {
+          injectDownloadButton();
+        }
+      }, 500);
+      sendResponse({ success: true });
+    } catch (e) {
+      console.error('requestInjectButton failed:', e);
+      sendResponse({ success: false, error: e?.message || String(e) });
+    }
+    return false;
+  }
+
   // Popup asks the page to (re)run extraction. This is critical for:
   // - slow internet (URLs appear late)
   // - lazy-loaded player/config
