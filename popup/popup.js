@@ -55,7 +55,7 @@ function initializePopup(tab) {
   setupNavigationDetection();
 
   // Clean up when popup is hidden (user switched tab or closed popup) to free memory
-  document.addEventListener('visibilitychange', () => {
+  document.addEventListener("visibilitychange", () => {
     if (document.hidden) cleanup();
   });
 
@@ -176,6 +176,8 @@ function wakeServiceWorkerAndGetData(tabId, expectedVideoId) {
 
         const videoData = response.videoData || { urls: [] };
         latestVideoData = videoData;
+
+        console.log(videoData, "[popup] videoData");
 
         // Check if we have videos for current page
         const hasVideos = videoData.urls && videoData.urls.length > 0;
@@ -475,7 +477,10 @@ function displayVideos(videoData) {
     // Hide any HLS URL that doesn't have a specific quality (hls-240p, hls-360p, etc.)
     // These are either master playlists or unparsed HLS streams. Allow hls-audio / hls-audio-*.
     if (v.type && isHLS(v.type)) {
-      if (v.type === "hls-audio" || (v.type && v.type.startsWith("hls-audio-"))) {
+      if (
+        v.type === "hls-audio" ||
+        (v.type && v.type.startsWith("hls-audio-"))
+      ) {
         return true; // Show audio tracks from EXT-X-MEDIA TYPE=AUDIO
       }
       const quality = extractQuality(v.type, v.url);
@@ -509,8 +514,16 @@ function displayVideos(videoData) {
     return;
   }
 
-  // Get video title from videoData (fallback)
-  const defaultVideoTitle = videoData.videoTitle || "Dailymotion Video";
+  // Get video title from videoData (fallback); never use "Dailymotion Video" in UI
+  let defaultVideoTitle =
+    cleanVideoTitle(videoData.videoTitle) || videoData.videoTitle || "Video";
+  if (
+    !defaultVideoTitle ||
+    defaultVideoTitle === "Dailymotion Video" ||
+    /dailymotion\s+video/i.test(defaultVideoTitle)
+  ) {
+    defaultVideoTitle = "Video";
+  }
 
   // Group videos by videoId (page/video)
   const videosByPage = {};
@@ -675,39 +688,15 @@ function displayVideos(videoData) {
         return qualityB - qualityA;
       });
 
-      // Deduplicate by quality AND type: keep one MP4 and one HLS per quality
-      // If multiple of the same type exist for same quality, keep the first one
-      const uniqueQualities = new Map();
+      // Deduplicate by URL only: show all variants (multiple 1080p HLS streams are different bitrates)
+      const uniqueByUrl = new Map();
       sortedQualities.forEach((video) => {
-        if (!video) return; // Skip invalid videos
-
-        const quality = extractQuality(video.type, video.url);
-        if (!quality) {
-          // If quality can't be determined, still include it but use a fallback key
-          // This prevents all videos from being filtered out
-          const isMP4Type = isMP4(video.type); // Using utility function
-          const isHLSType = isHLS(video.type); // Using utility function
-          const typeKey = isMP4Type ? "MP4" : isHLSType ? "HLS" : "OTHER";
-          const fallbackKey = `unknown-${typeKey}`;
-          if (!uniqueQualities.has(fallbackKey)) {
-            uniqueQualities.set(fallbackKey, video);
-          }
-          return;
+        if (!video || !video.url) return;
+        if (!uniqueByUrl.has(video.url)) {
+          uniqueByUrl.set(video.url, video);
         }
-
-        const isMP4Type = isMP4(video.type); // Using utility function
-        const isHLSType = isHLS(video.type); // Using utility function
-
-        // Create a unique key: quality + type (e.g., "360p-MP4" or "360p-HLS")
-        const typeKey = isMP4Type ? "MP4" : isHLSType ? "HLS" : "OTHER";
-        const qualityKey = `${quality}p-${typeKey}`;
-
-        // Only add if we don't already have this quality+type combination
-        if (!uniqueQualities.has(qualityKey)) {
-          uniqueQualities.set(qualityKey, video);
-        }
-        // If we already have this quality+type, skip (keep the first one)
       });
+      const uniqueQualities = uniqueByUrl;
 
       // Convert map back to array and sort: prefer MP4 over HLS, then by quality (highest first)
       const deduplicatedQualities = Array.from(uniqueQualities.values()).sort(
@@ -760,10 +749,11 @@ function displayVideos(videoData) {
       const videoIdForLookup = firstVideo.videoId
         ? String(firstVideo.videoId)
         : null;
-      
+
       // Check if this video belongs to the current page
-      const isCurrentPageVideo = currentVideoId && 
-        videoIdForLookup && 
+      const isCurrentPageVideo =
+        currentVideoId &&
+        videoIdForLookup &&
         String(currentVideoId) === videoIdForLookup;
 
       // Try to get title from videoId mapping first (most reliable)
@@ -776,9 +766,12 @@ function displayVideos(videoData) {
         if (titleFromMap) {
           // Validate that the title is not generic before using it
           const lowerTitle = titleFromMap.toLowerCase();
-          const isGeneric = titleFromMap === "Dailymotion Video" ||
+          const isGeneric =
+            titleFromMap === "Dailymotion Video" ||
             lowerTitle.includes("dailymotion video player") ||
-            lowerTitle.match(/^(dailymotion|video|dailymotion video player|video player)$/i);
+            lowerTitle.match(
+              /^(dailymotion|video|dailymotion video player|video player)$/i,
+            );
           if (!isGeneric) {
             displayTitle = titleFromMap;
           }
@@ -822,9 +815,21 @@ function displayVideos(videoData) {
         if (isCurrentPageVideo) {
           displayTitle = defaultVideoTitle;
         } else {
-          // For other videos, use a generic fallback instead of current page title
-          displayTitle = "Dailymotion Video";
+          displayTitle = "Video";
         }
+      }
+      // Never show "Dailymotion Video" in dropdown – use cleaned title or "Video"
+      displayTitle = (
+        cleanVideoTitle(displayTitle) ||
+        displayTitle ||
+        "Video"
+      ).trim();
+      if (
+        !displayTitle ||
+        displayTitle === "Dailymotion Video" ||
+        /dailymotion\s+video/i.test(displayTitle)
+      ) {
+        displayTitle = "Video";
       }
 
       // Create video item
@@ -841,6 +846,15 @@ function displayVideos(videoData) {
         const videoIndex = videoData.urls.findIndex((v) => v.url === video.url);
         qualityMenuItems += `<div class="quality-menu-item" data-index="${idx}" data-url="${video.url}" data-video-index="${videoIndex >= 0 ? videoIndex : ""}">${qualityLabel}</div>`;
       });
+      // Add MP3 option (uses lowest quality video, then convert to MP3)
+      const lowestQuality =
+        deduplicatedQualities[deduplicatedQualities.length - 1];
+      if (lowestQuality && lowestQuality.url) {
+        const lowestVideoIndex = videoData.urls.findIndex(
+          (v) => v.url === lowestQuality.url,
+        );
+        qualityMenuItems += `<div class="quality-menu-item" data-convert-mp3="1" data-url="${lowestQuality.url}" data-video-index="${lowestVideoIndex >= 0 ? lowestVideoIndex : ""}">MP3</div>`;
+      }
 
       // Get default selected video (should exist due to check above, but add safety check)
       const defaultVideo = deduplicatedQualities[0];
@@ -864,7 +878,7 @@ function displayVideos(videoData) {
         <div class="video-url" title="${defaultVideo.url}">${defaultShortUrl}</div>
       <div class="button-group">
           <div class="download-button-group">
-            <button class="download-btn" data-url="${defaultVideo.url}" data-index="${videoData.urls.findIndex((v) => v.url === defaultVideo.url)}" data-quality-label="${defaultQualityLabel}" data-display-title="${displayTitle.replace(/"/g, '&quot;')}">
+            <button class="download-btn" data-url="${defaultVideo.url}" data-index="${videoData.urls.findIndex((v) => v.url === defaultVideo.url)}" data-quality-label="${defaultQualityLabel}" data-display-title="${displayTitle.replace(/"/g, "&quot;")}">
               Download
             </button>
             <button class="download-dropdown-btn" aria-label="Select quality">
@@ -931,24 +945,36 @@ function displayVideos(videoData) {
       qualityMenu.querySelectorAll(".quality-menu-item").forEach((menuItem) => {
         menuItem.addEventListener("click", (e) => {
           e.stopPropagation();
-          
+
           // Get URL directly from data attribute (most reliable)
           const selectedUrl = menuItem.dataset.url;
           if (!selectedUrl) {
             console.error("No URL found in quality menu item:", menuItem);
             return;
           }
-          
+
+          const isMp3Option = menuItem.dataset.convertMp3 === "1";
+          if (isMp3Option) {
+            downloadBtn.dataset.convertMp3 = "true";
+          } else {
+            delete downloadBtn.dataset.convertMp3;
+          }
+
           // Find the actual video object from videoData.urls by URL (more reliable than index)
           let selectedVideo = videoData.urls.find((v) => v.url === selectedUrl);
           if (!selectedVideo) {
             // Fallback: try using index from deduplicatedQualities
             const selectedIndex = parseInt(menuItem.dataset.index);
-            if (selectedIndex >= 0 && selectedIndex < deduplicatedQualities.length) {
+            if (
+              selectedIndex >= 0 &&
+              selectedIndex < deduplicatedQualities.length
+            ) {
               const fallbackVideo = deduplicatedQualities[selectedIndex];
               if (fallbackVideo && fallbackVideo.url === selectedUrl) {
                 // Found it in deduplicatedQualities, now find in videoData.urls by URL
-                selectedVideo = videoData.urls.find((v) => v.url === selectedUrl);
+                selectedVideo = videoData.urls.find(
+                  (v) => v.url === selectedUrl,
+                );
               }
             }
             if (!selectedVideo) {
@@ -956,8 +982,10 @@ function displayVideos(videoData) {
               return;
             }
           }
-          
-          const qualityLabel = formatQualityLabel(selectedVideo);
+
+          const qualityLabel = isMp3Option
+            ? "MP3"
+            : formatQualityLabel(selectedVideo);
 
           // Update displayed URL
           const shortUrl =
@@ -972,8 +1000,11 @@ function displayVideos(videoData) {
           // Preserve the display title (don't change it when selecting quality)
           // The display title is already stored in data-display-title attribute
           // Find index by URL (more reliable than object reference)
-          const videoIndex = videoData.urls.findIndex((v) => v.url === selectedVideo.url);
-          downloadBtn.dataset.index = videoIndex >= 0 ? videoIndex.toString() : "";
+          const videoIndex = videoData.urls.findIndex(
+            (v) => v.url === selectedVideo.url,
+          );
+          downloadBtn.dataset.index =
+            videoIndex >= 0 ? videoIndex.toString() : "";
           downloadBtn.dataset.qualityLabel = qualityLabel;
           copyBtn.dataset.url = selectedVideo.url;
 
@@ -1018,8 +1049,9 @@ function displayVideos(videoData) {
   // Add event listeners for all download buttons
   document.querySelectorAll(".download-btn").forEach((btn) => {
     btn.addEventListener("click", (e) => {
-      const url = e.target.dataset.url;
-      const index = e.target.dataset.index;
+      const button = e.currentTarget;
+      const url = button.dataset.url;
+      const index = button.dataset.index;
       // Find the video item from videoData.urls
       const videoItem =
         videoData.urls.find((v) => v.url === url) ||
@@ -1027,21 +1059,23 @@ function displayVideos(videoData) {
 
       if (videoItem) {
         // Use the display title from the button (exactly what's shown in the list)
-        // This ensures the downloaded file name matches what the user sees
-        const videoTitle = e.target.dataset.displayTitle || 
-          videoItem.videoTitle || 
-          videoData.videoTitle || 
-          "Dailymotion Video";
-        // Get quality label from button if available
-        const qualityLabel = e.target.dataset.qualityLabel || "";
-        // Find index by URL (more reliable than object reference)
+        const videoTitle =
+          button.dataset.displayTitle ||
+          cleanVideoTitle(videoItem.videoTitle) ||
+          videoItem.videoTitle ||
+          cleanVideoTitle(videoData.videoTitle) ||
+          videoData.videoTitle ||
+          "Video";
+        const qualityLabel = button.dataset.qualityLabel || "";
+        const convertToMp3 = button.dataset.convertMp3 === "true";
         const videoIndex = videoData.urls.findIndex((v) => v.url === url);
         downloadVideo(
           url,
-          videoIndex >= 0 ? videoIndex : 0, // Fallback to 0 if not found
+          videoIndex >= 0 ? videoIndex : 0,
           videoItem.type,
           videoTitle,
           qualityLabel,
+          convertToMp3,
         );
       } else {
         console.error("Video item not found for URL:", url);
@@ -1143,7 +1177,7 @@ function formatTypeLabel(type) {
   if (type.includes("mp4")) {
     return type.toUpperCase();
   } else if (type.includes("m3u8") || type.includes("hls")) {
-    return "HLS Stream";
+    return "Stream";
   }
   return type.toUpperCase();
 }
@@ -1154,28 +1188,35 @@ function downloadVideo(
   type,
   videoTitle = "Dailymotion Video",
   qualityLabel = "",
+  convertToMp3 = false,
 ) {
+  // Use cleaned title for filename; never put "Dailymotion Video" in filename
+  const titleForFilename = cleanVideoTitle(videoTitle) || videoTitle || "video";
+  const baseTitle =
+    !titleForFilename ||
+    titleForFilename === "Dailymotion Video" ||
+    /dailymotion\s+video/i.test(titleForFilename)
+      ? "video"
+      : titleForFilename;
+
   // Sanitize filename: remove invalid characters, limit length
   const sanitizeFilename = (name) => {
-    // Remove invalid filename characters: / \ : * ? " < > |
-    let sanitized = name.replace(/[\/\\:\*\?"<>\|]/g, "");
-    // Remove leading/trailing spaces and dots
+    let sanitized = (name || "").replace(/[\/\\:\*\?"<>\|]/g, "");
     sanitized = sanitized.trim().replace(/^\.+|\.+$/g, "");
-    // Limit length to 200 characters (reasonable for most filesystems)
-    if (sanitized.length > 200) {
-      sanitized = sanitized.substring(0, 200);
-    }
-    // If empty after sanitization, use fallback
-    return sanitized || "Dailymotion Video";
+    if (sanitized.length > 200) sanitized = sanitized.substring(0, 200);
+    return sanitized || "video";
   };
 
-  const sanitizedTitle = sanitizeFilename(videoTitle);
-  const isAudio = type === "hls-audio" || (type && type.startsWith("hls-audio-"));
-  const extension = isAudio ? "m4a" : getExtension(url);
+  const sanitizedTitle = sanitizeFilename(baseTitle);
+  const isAudio =
+    type === "hls-audio" || (type && type.startsWith("hls-audio-"));
+  const extension = convertToMp3 ? "mp3" : isAudio ? "m4a" : getExtension(url);
 
   // Include quality in filename if available
   let filename;
-  if (qualityLabel && qualityLabel.trim()) {
+  if (convertToMp3) {
+    filename = `${sanitizedTitle} - MP3.mp3`;
+  } else if (qualityLabel && qualityLabel.trim()) {
     // For audio, use "Audio" as the part; for video use quality (e.g. 1080p)
     const qualityPart = isAudio
       ? "Audio"
@@ -1193,6 +1234,7 @@ function downloadVideo(
       filename: filename,
       type: type,
       qualityLabel: qualityLabel,
+      convertToMp3: convertToMp3,
       tabId: currentTabId,
       // Prefer the known videoId from captured data (avoids "fmp4" / other false IDs)
       videoId:

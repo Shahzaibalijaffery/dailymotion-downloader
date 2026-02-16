@@ -892,7 +892,7 @@ function startDownloadProgressPolling(downloadId, filename) {
               downloadId,
               filename,
               status || "Download complete!",
-              100
+              100,
             );
             // Stop polling after updating notification
             stopDownloadProgressPolling(downloadId);

@@ -393,10 +393,23 @@ function handleDownloadAction(
       });
     }
 
+    // When user chose MP3: use .mp3 filename and pass convertToMp3 so we convert after merge
+    const convertToMp3 = request.convertToMp3 === true;
+    const downloadFilename = convertToMp3
+      ? request.filename.replace(/\.[^.]+$/, "") + ".mp3"
+      : request.filename;
+
+    if (convertToMp3) {
+      info.filename = downloadFilename;
+      chrome.storage.local.set({
+        [`downloadInfo_${downloadId}`]: JSON.stringify(info),
+      });
+    }
+
     // Handle download with merging if needed
     handleDownload(
       request.url,
-      request.filename,
+      downloadFilename,
       request.type,
       downloadId,
       downloadControllers,
@@ -405,6 +418,7 @@ function handleDownloadAction(
       cleanupIndexedDBBlob,
       setupOffscreenDocument,
       blobToDataUrl,
+      convertToMp3,
     )
       .then(() => {
         // Remove from active downloads on success
@@ -552,6 +566,7 @@ async function handleDownload(
   cleanupIndexedDBBlob,
   setupOffscreenDocument,
   blobToDataUrl,
+  convertToMp3 = false,
 ) {
   // Check if already cancelled before starting
   if (await isDownloadCancelled(downloadId)) {
@@ -569,7 +584,9 @@ async function handleDownload(
     // Set initial progress immediately with download ID
     await chrome.storage.local.set({
       [`downloadProgress_${downloadId}`]: 0,
-      [`downloadStatus_${downloadId}`]: "Preparing download...",
+      [`downloadStatus_${downloadId}`]: convertToMp3
+        ? "Preparing MP3 download..."
+        : "Preparing download...",
     });
 
     // Check if it's an m3u8 playlist or range-based URL
@@ -588,6 +605,7 @@ async function handleDownload(
         cleanupIndexedDBBlob,
         setupOffscreenDocument,
         blobToDataUrl,
+        convertToMp3,
       );
     } else if (
       url.includes(".m3u8") ||
@@ -620,6 +638,7 @@ async function handleDownload(
         cleanupIndexedDBBlob,
         setupOffscreenDocument,
         blobToDataUrl,
+        convertToMp3,
       );
     } else if (isChunkedRangeUrl(url)) {
       // COMMENTED OUT: Range URLs are filtered out during storage and never shown in popup
@@ -640,6 +659,7 @@ async function handleDownload(
         cleanupIndexedDBBlob,
         setupOffscreenDocument,
         blobToDataUrl,
+        convertToMp3,
       );
       // Original code (commented out):
       // console.log('Detected range-based URL, fetching full video...');
@@ -658,6 +678,7 @@ async function handleDownload(
           cleanupIndexedDBBlob,
           setupOffscreenDocument,
           blobToDataUrl,
+          convertToMp3,
         );
       } else {
         // Direct download for other file types

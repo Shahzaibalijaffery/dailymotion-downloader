@@ -236,6 +236,19 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       return true;
     }
 
+    if (request.action === "convertToMp3") {
+      handleConvertToMp3(
+        request.blobId,
+        request.inputFormat || "ts",
+      )
+        .then((result) => sendResponse(result))
+        .catch((err) => {
+          console.error("convertToMp3 error:", err);
+          sendResponse({ success: false, error: err.message });
+        });
+      return true;
+    }
+
     if (request.action === "deleteChunksForBlob") {
       const { blobId, chunkCount } = request;
       if (!blobId || chunkCount == null) {
@@ -514,6 +527,88 @@ async function handleConvertToMp4(blobId, downloadId, onProgress) {
     outputBlobId,
     extension: "mp4",
     mimeType: "video/mp4",
+  };
+}
+
+/**
+ * Convert video (TS or MP4) in IDB to MP3 (audio only). Used when user selects "MP3" in download dropdown.
+ */
+async function handleConvertToMp3(blobId, inputFormat) {
+  const ext = inputFormat === "mp4" ? "mp4" : "ts";
+  const inputName = `input.${ext}`;
+
+  const db = await new Promise((resolve, reject) => {
+    const request = indexedDB.open("DailymotionDownloaderDB", 1);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (event) => {
+      const d = event.target.result;
+      if (!d.objectStoreNames.contains("blobs")) {
+        d.createObjectStore("blobs");
+      }
+    };
+  });
+
+  const arrayBuffer = await new Promise((resolve, reject) => {
+    const tx = db.transaction(["blobs"], "readonly");
+    const store = tx.objectStore("blobs");
+    const req = store.get(blobId);
+    req.onsuccess = () => {
+      const data = req.result;
+      if (!data || !(data instanceof ArrayBuffer)) {
+        reject(new Error(`Blob not found: ${blobId}`));
+      } else {
+        resolve(data);
+      }
+    };
+    req.onerror = () => reject(req.error || new Error("IDB read error"));
+  });
+  db.close();
+
+  const ffmpeg = await getFFmpeg();
+  const inputData = new Uint8Array(arrayBuffer);
+  await ffmpeg.writeFile(inputName, inputData);
+  // -vn = no video, -acodec libmp3lame -q:a 2 = good quality MP3
+  await ffmpeg.exec(["-i", inputName, "-vn", "-acodec", "libmp3lame", "-q:a", "2", "output.mp3"]);
+  const data = await ffmpeg.readFile("output.mp3");
+  try {
+    if (typeof ffmpeg.deleteFile === "function") {
+      await ffmpeg.deleteFile(inputName);
+      await ffmpeg.deleteFile("output.mp3");
+    }
+  } catch (e) {}
+
+  const outputBuffer =
+    data instanceof Uint8Array
+      ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+      : data;
+  if (!outputBuffer || !(outputBuffer instanceof ArrayBuffer)) {
+    throw new Error("FFmpeg did not produce MP3 output");
+  }
+
+  const outputBlobId =
+    "mp3_" + Date.now() + "_" + Math.random().toString(36).slice(2, 11);
+  await new Promise((resolve, reject) => {
+    const req = indexedDB.open("DailymotionDownloaderDB", 1);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => {
+      const database = req.result;
+      const tx = database.transaction(["blobs"], "readwrite");
+      const store = tx.objectStore("blobs");
+      store.put(outputBuffer, outputBlobId);
+      tx.oncomplete = () => {
+        database.close();
+        resolve();
+      };
+      tx.onerror = () => reject(tx.error);
+    };
+  });
+
+  return {
+    success: true,
+    outputBlobId,
+    extension: "mp3",
+    mimeType: "audio/mpeg",
   };
 }
 

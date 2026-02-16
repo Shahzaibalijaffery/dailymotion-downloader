@@ -17,7 +17,9 @@ let isRefreshing = false; // Prevent multiple simultaneous refreshes
  */
 function getCurrentVideoId() {
   try {
-    const videoIdMatch = window.location.pathname.match(/\/video\/([a-zA-Z0-9]+)/);
+    const videoIdMatch = window.location.pathname.match(
+      /\/video\/([a-zA-Z0-9]+)/,
+    );
     return videoIdMatch ? videoIdMatch[1] : null;
   } catch (e) {
     return null;
@@ -34,14 +36,23 @@ function getCurrentVideoTitle() {
     let title = document.title;
     if (title) {
       // Remove common suffixes: " - Dailymotion", " | Dailymotion", " - Watch on Dailymotion", etc.
-      title = title.replace(/\s*[-|]\s*Dailymotion.*$/i, '').trim();
-      title = title.replace(/\s*[-|]\s*Watch.*Dailymotion.*$/i, '').trim();
+      title = title.replace(/\s*[-|]\s*Dailymotion.*$/i, "").trim();
+      title = title.replace(/\s*[-|]\s*Watch.*Dailymotion.*$/i, "").trim();
       // Remove "Dailymotion Video Player" if it's the entire title or a suffix
-      title = title.replace(/\s*[-|]\s*Dailymotion\s+Video\s+Player.*$/i, '').trim();
-      title = title.replace(/^Dailymotion\s+Video\s+Player\s*[-|]?\s*/i, '').trim();
+      title = title
+        .replace(/\s*[-|]\s*Dailymotion\s+Video\s+Player.*$/i, "")
+        .trim();
+      title = title
+        .replace(/^Dailymotion\s+Video\s+Player\s*[-|]?\s*/i, "")
+        .trim();
       // Filter out generic titles
-      if (title && title.length > 2 && 
-          !title.toLowerCase().match(/^(dailymotion|video|dailymotion video player|video player)$/i)) {
+      if (
+        title &&
+        title.length > 2 &&
+        !title
+          .toLowerCase()
+          .match(/^(dailymotion|video|dailymotion video player|video player)$/i)
+      ) {
         return title;
       }
     }
@@ -63,7 +74,7 @@ function stopPageTrackingIntervals() {
     clearInterval(dataCheckInterval);
     dataCheckInterval = null;
   }
-  if (typeof clearSeenUrls === 'function') {
+  if (typeof clearSeenUrls === "function") {
     clearSeenUrls();
   }
 }
@@ -86,27 +97,34 @@ function checkTransitionToVideoPage() {
   if (isVideoPage()) {
     const currentUrl = window.location.href;
     const currentVideoId = getCurrentVideoId();
-    if (currentUrl !== lastUrl || (currentVideoId && currentVideoId !== lastVideoId)) {
+    if (
+      currentUrl !== lastUrl ||
+      (currentVideoId && currentVideoId !== lastVideoId)
+    ) {
       lastUrl = currentUrl;
       lastVideoId = currentVideoId;
       stopTransitionCheckInterval();
       if (isRefreshing) return;
       isRefreshing = true;
-      if (typeof destroyDownloadButton === 'function') {
+      if (typeof destroyDownloadButton === "function") {
         destroyDownloadButton();
       } else {
-        document.querySelectorAll('#vimeo-downloader-page-button-wrapper').forEach((w) => w.remove());
+        document
+          .querySelectorAll("#vimeo-downloader-page-button-wrapper")
+          .forEach((w) => w.remove());
       }
       setTimeout(() => {
         isRefreshing = false;
         if (isVideoPage()) {
           startPageTrackingIntervals();
-          if (typeof injectDownloadButton === 'function') {
+          if (typeof injectDownloadButton === "function") {
             injectDownloadButton();
           }
-          if (typeof resetRestoreRetryCount === 'function') resetRestoreRetryCount();
+          if (typeof resetRestoreRetryCount === "function")
+            resetRestoreRetryCount();
           setTimeout(() => {
-            if (typeof restoreActiveDownloads === 'function') restoreActiveDownloads();
+            if (typeof restoreActiveDownloads === "function")
+              restoreActiveDownloads();
           }, 1000);
         }
       }, 2500);
@@ -128,7 +146,7 @@ function startTransitionCheckInterval() {
  */
 function checkUrlChange() {
   const currentUrl = window.location.href;
-  
+
   // When not on video page: stop video-page intervals and start polling for transition TO /video
   if (!isVideoPage()) {
     stopPageTrackingIntervals();
@@ -137,38 +155,45 @@ function checkUrlChange() {
   }
   stopTransitionCheckInterval();
   const currentVideoId = getCurrentVideoId();
-  
-  if (currentUrl !== lastUrl || (currentVideoId && currentVideoId !== lastVideoId)) {
+
+  if (
+    currentUrl !== lastUrl ||
+    (currentVideoId && currentVideoId !== lastVideoId)
+  ) {
     const previousVideoId = lastVideoId;
     lastUrl = currentUrl;
     lastVideoId = currentVideoId;
-    
+
     // Prevent multiple simultaneous refreshes
     if (isRefreshing) return;
     isRefreshing = true;
-    
+
     // DON'T clean up download notifications when navigating - users should see all active downloads
     // The cleanupDownloadsForVideo function is disabled to allow downloads to persist across navigation
     // This way users can navigate between videos and still see their active downloads
-    
+
     // COMPLETELY destroy button and all associated data to prevent stale data
-    if (typeof destroyDownloadButton === 'function') {
+    if (typeof destroyDownloadButton === "function") {
       destroyDownloadButton();
     } else {
       // Fallback: Remove button wrapper if destroyDownloadButton is not available
-      document.querySelectorAll('#vimeo-downloader-page-button-wrapper').forEach(wrapper => {
-        const downloadBtn = wrapper.querySelector('.vimeo-downloader-download-btn');
-        if (downloadBtn) {
-          downloadBtn.removeAttribute('data-url');
-          downloadBtn.removeAttribute('data-type');
-          downloadBtn.removeAttribute('data-quality-label');
-          downloadBtn.removeAttribute('data-video-title');
-          downloadBtn.removeAttribute('data-video-id');
-        }
-        wrapper.remove();
-      });
+      document
+        .querySelectorAll("#vimeo-downloader-page-button-wrapper")
+        .forEach((wrapper) => {
+          const downloadBtn = wrapper.querySelector(
+            ".vimeo-downloader-download-btn",
+          );
+          if (downloadBtn) {
+            downloadBtn.removeAttribute("data-url");
+            downloadBtn.removeAttribute("data-type");
+            downloadBtn.removeAttribute("data-quality-label");
+            downloadBtn.removeAttribute("data-video-title");
+            downloadBtn.removeAttribute("data-video-id");
+          }
+          wrapper.remove();
+        });
     }
-    
+
     // Re-inject button with fresh data after a delay (to allow new video data to be detected)
     // Use longer delay to ensure new video data is available
     setTimeout(() => {
@@ -176,15 +201,15 @@ function checkUrlChange() {
       // Only re-inject if we're still on a video page
       if (isVideoPage()) {
         startPageTrackingIntervals(); // Ensure intervals run on video page
-        if (typeof injectDownloadButton === 'function') {
+        if (typeof injectDownloadButton === "function") {
           injectDownloadButton();
         }
         // Also restore active downloads when video is detected (in case of page refresh)
-        if (typeof resetRestoreRetryCount === 'function') {
+        if (typeof resetRestoreRetryCount === "function") {
           resetRestoreRetryCount();
         }
         setTimeout(() => {
-          if (typeof restoreActiveDownloads === 'function') {
+          if (typeof restoreActiveDownloads === "function") {
             restoreActiveDownloads();
           }
         }, 1000);
@@ -206,7 +231,10 @@ function cleanupDownloadsForVideo(videoId) {
   // Function disabled - do not clean up downloads when navigating
   // Users should see all active downloads even when navigating between videos
   const originalConsoleLog = console.log;
-  originalConsoleLog('ℹ️ cleanupDownloadsForVideo called but disabled - downloads persist across navigation:', videoId);
+  originalConsoleLog(
+    "ℹ️ cleanupDownloadsForVideo called but disabled - downloads persist across navigation:",
+    videoId,
+  );
   return;
 }
 
@@ -216,39 +244,74 @@ function cleanupDownloadsForVideo(videoId) {
 function verifyButtonData() {
   if (!isVideoPage()) return; // Skip when not on video page (intervals may still be running briefly)
   if (isRefreshing) return;
-  
-  const buttonWrapper = document.getElementById('vimeo-downloader-page-button-wrapper');
+
+  const buttonWrapper = document.getElementById(
+    "vimeo-downloader-page-button-wrapper",
+  );
   if (!buttonWrapper) return;
-  
-  const downloadBtn = buttonWrapper.querySelector('.vimeo-downloader-download-btn');
+
+  const downloadBtn = buttonWrapper.querySelector(
+    ".vimeo-downloader-download-btn",
+  );
   if (!downloadBtn) return;
-  
+
   const currentVideoId = getCurrentVideoId();
   const currentVideoTitle = getCurrentVideoTitle();
-  const storedVideoId = downloadBtn.getAttribute('data-video-id');
-  const storedVideoTitle = downloadBtn.getAttribute('data-video-title');
-  
+  const storedVideoId = downloadBtn.getAttribute("data-video-id");
+  const storedVideoTitle = downloadBtn.getAttribute("data-video-title");
+
+  // Normalize title the same way we set it on the button (cleanVideoTitle) so we don't
+  // refresh when the only difference is " - video Dailymotion" vs cleaned "My Video"
+  function normalizeTitleForComparison(t) {
+    if (!t || typeof t !== "string") return "";
+    const cleaned =
+      typeof cleanVideoTitle === "function" ? cleanVideoTitle(t) : null;
+    if (cleaned) return cleaned.toLowerCase().trim().replace(/\s+/g, " ");
+    const raw = String(t).toLowerCase().trim().replace(/\s+/g, " ");
+    if (!raw || /^(dailymotion|video|dailymotion video|video dailymotion|video player)$/i.test(raw))
+      return "video";
+    return raw;
+  }
+
   // Check if video title changed (most reliable indicator)
   let shouldRefresh = false;
-  if (currentVideoTitle && storedVideoTitle) {
-    const normalizedCurrent = currentVideoTitle.toLowerCase().trim().replace(/\s+/g, ' ');
-    const normalizedStored = storedVideoTitle.toLowerCase().trim().replace(/\s+/g, ' ');
+  if (currentVideoTitle || storedVideoTitle) {
+    const normalizedCurrent = normalizeTitleForComparison(currentVideoTitle);
+    const normalizedStored = normalizeTitleForComparison(storedVideoTitle);
     if (normalizedCurrent !== normalizedStored) {
       shouldRefresh = true;
-      const DEBUG = false; // Can be made configurable
-      if (DEBUG) console.log('Video title mismatch detected, refreshing button:', currentVideoTitle, 'vs', storedVideoTitle);
+      const DEBUG = false;
+      if (DEBUG)
+        console.log(
+          "Video title mismatch detected, refreshing button:",
+          currentVideoTitle,
+          "vs",
+          storedVideoTitle,
+        );
     }
-  } else if (currentVideoId && storedVideoId && currentVideoId !== storedVideoId) {
+  }
+  if (
+    !shouldRefresh &&
+    currentVideoId &&
+    storedVideoId &&
+    currentVideoId !== storedVideoId
+  ) {
     // Fallback to video ID check if title not available
     shouldRefresh = true;
     const DEBUG = false;
-    if (DEBUG) console.log('Video ID mismatch detected, refreshing button:', currentVideoId, 'vs', storedVideoId);
+    if (DEBUG)
+      console.log(
+        "Video ID mismatch detected, refreshing button:",
+        currentVideoId,
+        "vs",
+        storedVideoId,
+      );
   }
-  
+
   if (shouldRefresh) {
     isRefreshing = true;
     // Completely destroy button to prevent stale data
-    if (typeof destroyDownloadButton === 'function') {
+    if (typeof destroyDownloadButton === "function") {
       destroyDownloadButton();
     } else {
       // Fallback: just remove wrapper
@@ -256,7 +319,7 @@ function verifyButtonData() {
     }
     setTimeout(() => {
       isRefreshing = false;
-      if (typeof injectDownloadButton === 'function') {
+      if (typeof injectDownloadButton === "function") {
         injectDownloadButton();
       }
     }, 1000);
@@ -291,24 +354,24 @@ function initializePageTracking() {
   // Also listen to history API changes (for SPA navigation)
   if (window.history && window.history.pushState) {
     const originalPushState = window.history.pushState;
-    window.history.pushState = function(...args) {
+    window.history.pushState = function (...args) {
       originalPushState.apply(window.history, args);
       setTimeout(checkUrlChange, 100);
     };
-    
+
     const originalReplaceState = window.history.replaceState;
-    window.history.replaceState = function(...args) {
+    window.history.replaceState = function (...args) {
       originalReplaceState.apply(window.history, args);
       setTimeout(checkUrlChange, 100);
     };
-    
-    window.addEventListener('popstate', () => {
+
+    window.addEventListener("popstate", () => {
       setTimeout(checkUrlChange, 100);
     });
   }
 
   // When tab is hidden, stop intervals to save memory/CPU; restart when visible
-  document.addEventListener('visibilitychange', () => {
+  document.addEventListener("visibilitychange", () => {
     if (document.hidden) {
       stopPageTrackingIntervals();
       stopTransitionCheckInterval();

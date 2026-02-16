@@ -3,6 +3,41 @@
  * Handles downloading HLS playlists, segments, and merging them into a single video file
  */
 
+/** Set true to enable verbose playlist/segment logging in console. */
+const DEBUG_M3U8 = false;
+const _m3u8Log = console.log.bind(console);
+function dmLog(...args) {
+  if (DEBUG_M3U8) _m3u8Log("[M3U8]", ...args);
+}
+
+/** Get base URL (with trailing slash) for resolving relative playlist URIs. */
+function getBaseUrl(url) {
+  return url.substring(0, url.lastIndexOf("/") + 1);
+}
+
+/**
+ * Resolve a URI from a playlist against a base URL (http(s), /, ./, or relative).
+ * Used by parseM3U8, parseMasterPlaylist, and parseMasterPlaylistAudio.
+ */
+function resolvePlaylistUri(uri, baseUrl) {
+  if (uri.startsWith("http://") || uri.startsWith("https://")) return uri;
+  if (uri.startsWith("/")) {
+    const urlObj = new URL(baseUrl);
+    return `${urlObj.protocol}//${urlObj.host}${uri}`;
+  }
+  if (uri.startsWith("./")) return baseUrl + uri.substring(2);
+  return baseUrl + uri;
+}
+
+/** Detect master playlist type (video variants and/or audio tracks). */
+function getMasterPlaylistInfo(playlistText) {
+  const hasVideoVariants =
+    playlistText && playlistText.includes("#EXT-X-STREAM-INF");
+  const hasAudioMedia =
+    playlistText && /#EXT-X-MEDIA:.*TYPE=AUDIO/i.test(playlistText);
+  return { hasVideoVariants, hasAudioMedia };
+}
+
 /**
  * Get fetch options with proper headers for Dailymotion requests
  * @param {string} url - The URL to fetch
@@ -52,6 +87,79 @@ async function getFetchOptionsWithHeaders(
   return options;
 }
 
+const BLOB_DB_NAME = "DailymotionDownloaderDB";
+const BLOB_STORE = "blobs";
+
+/** Open IndexedDB for blob storage (creates "blobs" store if needed). */
+function openBlobDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(BLOB_DB_NAME, 1);
+    req.onerror = () => reject(req.error);
+    req.onsuccess = () => resolve(req.result);
+    req.onupgradeneeded = (e) => {
+      if (!e.target.result.objectStoreNames.contains(BLOB_STORE)) {
+        e.target.result.createObjectStore(BLOB_STORE);
+      }
+    };
+  });
+}
+
+/**
+ * Write blobs to IDB as chunk_0, chunk_1, ...
+ * @param {IDBDatabase} db
+ * @param {string} blobIdPrefix - e.g. "convert_input_123_abc"
+ * @param {Blob[]|ArrayBuffer[]} blobs
+ * @param {{ onProgress?: (i: number, total: number) => void, downloadId?: string }} options
+ */
+async function putBlobChunksInIDB(db, blobIdPrefix, blobs, options = {}) {
+  const { onProgress, downloadId } = options;
+  for (let i = 0; i < blobs.length; i++) {
+    const buf =
+      blobs[i] instanceof ArrayBuffer ? blobs[i] : await blobs[i].arrayBuffer();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction([BLOB_STORE], "readwrite");
+      tx.objectStore(BLOB_STORE).put(buf, `${blobIdPrefix}_chunk_${i}`);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    if (onProgress) onProgress(i + 1, blobs.length);
+    if (downloadId && i % 15 === 0 && blobs.length > 15) {
+      await chrome.storage.local.set({
+        [`downloadStatus_${downloadId}`]: `Storing (batch ${i + 1}/${blobs.length})...`,
+      });
+      try {
+        await new Promise((r) =>
+          chrome.runtime.sendMessage({ action: "ping" }, () => r()),
+        );
+      } catch (e) {}
+    }
+  }
+}
+
+/** Build segment Blobs from ArrayBuffers in batches. */
+function buffersToSegmentBlobs(
+  segmentBuffers,
+  blobBatchSize,
+  mimeType = "video/mp4",
+) {
+  const out = [];
+  for (let i = 0; i < segmentBuffers.length; i += blobBatchSize) {
+    const batch = segmentBuffers.slice(
+      i,
+      Math.min(i + blobBatchSize, segmentBuffers.length),
+    );
+    out.push(new Blob(batch, { type: mimeType }));
+  }
+  return out;
+}
+
+/** Set download progress and status in storage. */
+async function setDownloadProgress(downloadId, percent, status) {
+  const payload = { [`downloadProgress_${downloadId}`]: percent };
+  if (status != null) payload[`downloadStatus_${downloadId}`] = status;
+  await chrome.storage.local.set(payload);
+}
+
 /**
  * Parse M3U8 playlist to extract segments and init segment URL
  * @param {string} playlistText - The M3U8 playlist text
@@ -72,37 +180,21 @@ function parseM3U8(playlistText, baseUrl) {
       (upperLine.includes("INIT") && line.startsWith("#"))
     );
   });
-  if (mapLines.length > 0) {
-    console.log(
-      `Found ${mapLines.length} potential MAP/init line(s) in playlist`,
-    );
-    mapLines.slice(0, 3).forEach((line, idx) => {
-      console.log(`  MAP line ${idx + 1}:`, line.substring(0, 150));
-    });
-  }
+  if (mapLines.length > 0) dmLog(`MAP/init lines: ${mapLines.length}`);
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i].trim();
     const upperLine = line.toUpperCase();
 
-    // Check for init segment (map URL) - case-insensitive
-    // Format: #EXT-X-MAP:URI="..." or #EXT-X-MAP:URI=... or just #EXT-X-MAP:...
     if (upperLine.startsWith("#EXT-X-MAP")) {
-      console.log("Processing #EXT-X-MAP line:", line.substring(0, 200));
       let uri = null;
-
-      // Try different parsing methods
-      // Method 1: URI="..." or URI=...
       const uriMatch1 = line.match(/URI=["']?([^"'\s]+)["']?/i);
       if (uriMatch1) {
         uri = uriMatch1[1];
-        console.log("  Extracted URI via Method 1:", uri);
       } else {
-        // Method 2: Direct URL after colon (less common)
         const colonIndex = line.indexOf(":");
         if (colonIndex !== -1) {
           const afterColon = line.substring(colonIndex + 1).trim();
-          // Check if it looks like a URL or path
           if (
             afterColon &&
             (afterColon.startsWith("http") ||
@@ -110,46 +202,22 @@ function parseM3U8(playlistText, baseUrl) {
               afterColon.startsWith("./"))
           ) {
             uri = afterColon;
-            console.log("  Extracted URI via Method 2:", uri);
           }
         }
-
-        // Method 3: Try to find any URL-like string in the line
         if (!uri) {
           const urlMatch = line.match(
             /(https?:\/\/[^\s"']+|\.\/[^\s"']+|\/[^\s"']+)/,
           );
-          if (urlMatch) {
-            uri = urlMatch[1];
-            console.log("  Extracted URI via Method 3 (URL pattern):", uri);
-          }
+          if (urlMatch) uri = urlMatch[1];
         }
       }
 
       if (uri) {
-        // Decode URI if needed
         try {
           uri = decodeURIComponent(uri);
-        } catch (e) {
-          // URI might not be encoded, continue with original
-        }
-
-        if (uri.startsWith("http://") || uri.startsWith("https://")) {
-          initSegmentUrl = uri;
-        } else if (uri.startsWith("/")) {
-          const urlObj = new URL(baseUrl);
-          initSegmentUrl = `${urlObj.protocol}//${urlObj.host}${uri}`;
-        } else if (uri.startsWith("./")) {
-          initSegmentUrl = baseUrl + uri.substring(2);
-        } else {
-          initSegmentUrl = baseUrl + uri;
-        }
-        console.log(
-          "✅ Found #EXT-X-MAP with URI:",
-          uri,
-          "-> resolved to:",
-          initSegmentUrl,
-        );
+        } catch (e) {}
+        initSegmentUrl = resolvePlaylistUri(uri, baseUrl);
+        dmLog("EXT-X-MAP resolved:", initSegmentUrl);
       } else {
         console.warn(
           "⚠️ Found #EXT-X-MAP but could not extract URI. Full line:",
@@ -162,37 +230,38 @@ function parseM3U8(playlistText, baseUrl) {
     // Skip other comments and empty lines
     if (line.startsWith("#") || !line) continue;
 
-    // If line is a URL
-    if (line.startsWith("http://") || line.startsWith("https://")) {
-      segments.push(line);
-    } else if (line.startsWith("/")) {
-      // Relative URL from root
-      const urlObj = new URL(baseUrl);
-      segments.push(`${urlObj.protocol}//${urlObj.host}${line}`);
-    } else {
-      // Relative URL
-      segments.push(baseUrl + line);
-    }
+    if (line) segments.push(resolvePlaylistUri(line, baseUrl));
   }
 
-  // Log summary
-  if (initSegmentUrl) {
-    console.log(
-      `✅ parseM3U8: Found ${segments.length} segments and init segment: ${initSegmentUrl}`,
+  if (!initSegmentUrl && mapLines.length > 0) {
+    console.warn(
+      `parseM3U8: ${segments.length} segments, no init URL parsed from ${mapLines.length} MAP line(s)`,
     );
-  } else {
-    console.log(
-      `⚠️ parseM3U8: Found ${segments.length} segments but NO init segment`,
-    );
-    if (mapLines.length > 0) {
-      console.warn(
-        `  Note: Found ${mapLines.length} potential MAP line(s) but couldn't parse init segment URL`,
-      );
-    }
   }
-
-  // Return both segments and init segment URL
   return { segments, initSegmentUrl };
+}
+
+/**
+ * Map any height to standard quality tier (240 up to 8K/4320). See scripts/utils.js for same list.
+ * @param {number} height - Height from RESOLUTION or bandwidth estimate
+ * @returns {number|null} - 240, 380, 480, 720, 1080, 1440, 2160, or 4320 (8K)
+ */
+function normalizeToDailymotionQuality(height) {
+  if (height == null || typeof height !== "number" || isNaN(height))
+    return null;
+
+  // DailyMotion standard tiers in ascending order
+  const tiers = [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320];
+
+  // Loop through tiers and map to previous tier if height is less than next tier
+  for (let i = 1; i < tiers.length; i++) {
+    if (height < tiers[i]) {
+      return tiers[i - 1];
+    }
+  }
+
+  // If height is larger than last tier, return the last tier (8K)
+  return tiers[tiers.length - 1];
 }
 
 /**
@@ -218,18 +287,7 @@ function parseMasterPlaylist(playlistText, baseUrl) {
 
       currentVariant = { bandwidth, resolution };
     } else if (line && !line.startsWith("#") && currentVariant) {
-      // This is the URL for the variant
-      let variantUrl;
-      if (line.startsWith("http://") || line.startsWith("https://")) {
-        variantUrl = line;
-      } else if (line.startsWith("/")) {
-        const urlObj = new URL(baseUrl);
-        variantUrl = `${urlObj.protocol}//${urlObj.host}${line}`;
-      } else {
-        variantUrl = baseUrl + line;
-      }
-
-      currentVariant.url = variantUrl;
+      currentVariant.url = resolvePlaylistUri(line, baseUrl);
       variants.push(currentVariant);
       currentVariant = null;
     }
@@ -237,6 +295,8 @@ function parseMasterPlaylist(playlistText, baseUrl) {
 
   // Sort by bandwidth (highest first)
   variants.sort((a, b) => b.bandwidth - a.bandwidth);
+
+  dmLog(variants, "[bg variants] variants");
 
   return variants;
 }
@@ -264,26 +324,35 @@ function parseMasterPlaylistAudio(playlistText, baseUrl) {
     const nameMatch =
       line.match(/NAME="([^"]+)"/) || line.match(/NAME='([^']+)'/);
     const name = nameMatch ? nameMatch[1] : "Audio";
-
-    let trackUrl;
-    const uri = uriMatch[1].trim();
-    if (uri.startsWith("http://") || uri.startsWith("https://")) {
-      trackUrl = uri;
-    } else if (uri.startsWith("/")) {
-      try {
-        const urlObj = new URL(baseUrl);
-        trackUrl = `${urlObj.protocol}//${urlObj.host}${uri}`;
-      } catch (e) {
-        continue;
-      }
-    } else {
-      trackUrl = baseUrl + uri;
+    try {
+      const trackUrl = resolvePlaylistUri(uriMatch[1].trim(), baseUrl);
+      audioTracks.push({ url: trackUrl, name });
+    } catch (e) {
+      continue;
     }
-
-    audioTracks.push({ url: trackUrl, name });
   }
 
   return audioTracks;
+}
+
+/**
+ * Parse master playlist text into variants and audio tracks (pure parse, no fetch/store).
+ * Used by configParser for "fetch in config → parse here → store in config".
+ * @param {string} playlistText - Raw M3U8 master playlist text
+ * @param {string} masterPlaylistUrl - Master playlist URL (for baseUrl)
+ * @returns {{ variants: Array<{url, bandwidth, resolution}>, audioTracks: Array<{url, name}> }}
+ */
+function parseMasterPlaylistToVariants(playlistText, masterPlaylistUrl) {
+  const { hasVideoVariants, hasAudioMedia } =
+    getMasterPlaylistInfo(playlistText);
+  const baseUrl = getBaseUrl(masterPlaylistUrl);
+  const variants = hasVideoVariants
+    ? parseMasterPlaylist(playlistText, baseUrl)
+    : [];
+  const audioTracks = hasAudioMedia
+    ? parseMasterPlaylistAudio(playlistText, baseUrl)
+    : [];
+  return { variants, audioTracks };
 }
 
 /**
@@ -628,6 +697,49 @@ async function downloadViaChunkedMp4Conversion(
   });
 }
 
+/**
+ * Convert video blob in IDB to MP3 via offscreen, then download the MP3.
+ */
+async function convertVideoToMp3AndDownload(
+  blobId,
+  inputFormat,
+  mp3Filename,
+  downloadId,
+  downloadControllers,
+  activeChromeDownloads,
+  cleanupIndexedDBBlob,
+  setupOffscreenDocument,
+  blobToDataUrl,
+) {
+  await setupOffscreenDocument();
+  const result = await new Promise((resolve) => {
+    chrome.runtime.sendMessage(
+      { action: "convertToMp3", blobId, inputFormat },
+      (r) => resolve(r || { success: false }),
+    );
+  });
+  if (!result.success || !result.outputBlobId) {
+    throw new Error(result.error || "MP3 conversion failed");
+  }
+  await chrome.storage.local.set({
+    [`downloadStatus_${downloadId}`]: "Saving MP3...",
+  });
+  await downloadBlob(
+    {
+      blobId: result.outputBlobId,
+      mimeType: result.mimeType || "audio/mpeg",
+    },
+    mp3Filename,
+    downloadId,
+    downloadControllers,
+    activeChromeDownloads,
+    cleanupIndexedDBBlob,
+    setupOffscreenDocument,
+    blobToDataUrl,
+  );
+  cleanupIndexedDBBlob(result.outputBlobId);
+}
+
 async function downloadAndMergeM3U8(
   m3u8Url,
   filename,
@@ -639,22 +751,24 @@ async function downloadAndMergeM3U8(
   cleanupIndexedDBBlob,
   setupOffscreenDocument,
   blobToDataUrl,
+  convertToMp3 = false,
 ) {
+  const mp3Filename = convertToMp3
+    ? filename.replace(/\.[^.]+$/, "") + ".mp3"
+    : filename;
   try {
-    // Set initial progress immediately
-    await chrome.storage.local.set({
-      [`downloadProgress_${downloadId}`]: 1,
-      [`downloadStatus_${downloadId}`]: "Fetching playlist...",
-    });
+    await setDownloadProgress(
+      downloadId,
+      1,
+      convertToMp3 ? "Fetching playlist (MP3)..." : "Fetching playlist...",
+    );
 
     // Check if cancelled before starting
     if (abortController.signal.aborted) {
       throw new DOMException("Download cancelled", "AbortError");
     }
 
-    // Fix URL encoding issues
     m3u8Url = fixUrlEncoding(m3u8Url);
-    console.log("Fixed m3u8 URL:", m3u8Url);
 
     // Fetch the m3u8 playlist with error handling and proper headers
     let playlistResponse;
@@ -685,73 +799,26 @@ async function downloadAndMergeM3U8(
       throw new Error("Playlist file is empty or invalid");
     }
 
-    // Log the fetched playlist for debugging
-    console.log(`=== FETCHED PLAYLIST FROM: ${m3u8Url} ===`);
-    console.log(
-      `Playlist size: ${playlistText.length} characters, ${playlistText.split("\n").length} lines`,
-    );
-    const initialLines = playlistText.split("\n");
-    console.log("First 30 lines of fetched playlist:");
-    initialLines.slice(0, 30).forEach((line, idx) => {
-      console.log(`Initial line ${idx + 1}:`, line.substring(0, 200));
-    });
+    await setDownloadProgress(downloadId, 2, "Parsing playlist...");
 
-    // Check for MAP/INIT in initial playlist
-    const initialMapLines = initialLines.filter((line) => {
-      const upper = line.toUpperCase();
-      return (
-        upper.includes("MAP") ||
-        upper.includes("INIT") ||
-        upper.includes("EXT-X-MAP")
-      );
-    });
-    if (initialMapLines.length > 0) {
-      console.log(
-        `=== FOUND ${initialMapLines.length} MAP/INIT LINES IN INITIAL PLAYLIST ===`,
-      );
-      initialMapLines.forEach((line, idx) => {
-        console.log(`Initial MAP/INIT ${idx + 1}:`, line);
-      });
-    }
-    console.log("=== END INITIAL PLAYLIST CONTENT ===");
-
-    // Update progress after fetching playlist
-    await chrome.storage.local.set({
-      [`downloadProgress_${downloadId}`]: 2,
-      [`downloadStatus_${downloadId}`]: "Parsing playlist...",
-    });
-
-    // Check if this is a master playlist (contains #EXT-X-STREAM-INF)
-    const isMasterPlaylist = playlistText.includes("#EXT-X-STREAM-INF");
-    console.log(`Is master playlist: ${isMasterPlaylist}`);
+    const { hasVideoVariants: isMasterPlaylist } =
+      getMasterPlaylistInfo(playlistText);
+    dmLog("Playlist size:", playlistText.length, "master:", isMasterPlaylist);
 
     let segments = [];
     let initSegmentUrl = null;
 
     if (isMasterPlaylist) {
-      // This is a master playlist - find the best quality variant
-      console.log("Master playlist detected, finding best quality...");
-      const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf("/") + 1);
-
-      // First, check if master playlist itself has #EXT-X-MAP (rare but possible)
+      const baseUrl = getBaseUrl(m3u8Url);
       const masterParsed = parseM3U8(playlistText, baseUrl);
-      if (masterParsed.initSegmentUrl) {
-        console.log(
-          "Found init segment in master playlist:",
-          masterParsed.initSegmentUrl,
-        );
+      if (masterParsed.initSegmentUrl)
         initSegmentUrl = masterParsed.initSegmentUrl;
-      }
 
       const variantPlaylists = parseMasterPlaylist(playlistText, baseUrl);
-
       if (variantPlaylists.length === 0) {
         throw new Error("No variant playlists found in master playlist");
       }
-
-      // Use the first (usually highest quality) variant
       let variantUrl = variantPlaylists[0].url;
-      console.log(`Using variant playlist: ${variantUrl}`);
 
       // Check if cancelled
       if (abortController.signal.aborted) {
@@ -790,55 +857,13 @@ async function downloadAndMergeM3U8(
         throw new Error("Variant playlist file is empty or invalid");
       }
 
-      // Log variant playlist content for debugging
-      console.log(
-        `=== VARIANT PLAYLIST CONTENT (${variantText.length} chars, ${variantText.split("\n").length} lines) ===`,
-      );
-      const variantLines = variantText.split("\n");
-      console.log("First 50 lines of variant playlist:");
-      variantLines.slice(0, 50).forEach((line, idx) => {
-        console.log(`Variant line ${idx + 1}:`, line.substring(0, 200));
-      });
-
-      // Find all MAP/INIT related lines in variant
-      const variantMapLines = variantLines.filter((line) => {
-        const upper = line.toUpperCase();
-        return (
-          upper.includes("MAP") ||
-          upper.includes("INIT") ||
-          upper.includes("EXT-X-MAP")
-        );
-      });
-      if (variantMapLines.length > 0) {
-        console.log(
-          `=== FOUND ${variantMapLines.length} MAP/INIT LINES IN VARIANT ===`,
-        );
-        variantMapLines.forEach((line, idx) => {
-          console.log(`Variant MAP/INIT ${idx + 1}:`, line);
-        });
-      } else {
-        console.warn("⚠️ No MAP/INIT lines found in variant playlist");
-      }
-      console.log("=== END VARIANT PLAYLIST CONTENT ===");
-
-      const variantBaseUrl = variantUrl.substring(
-        0,
-        variantUrl.lastIndexOf("/") + 1,
-      );
-      const parsed = parseM3U8(variantText, variantBaseUrl);
+      const parsed = parseM3U8(variantText, getBaseUrl(variantUrl));
       segments = parsed.segments;
 
-      // Use init segment from variant if found, otherwise use from master (if any)
       if (parsed.initSegmentUrl) {
         initSegmentUrl = parsed.initSegmentUrl;
-        console.log("Found init segment in variant playlist:", initSegmentUrl);
       } else if (!initSegmentUrl) {
-        // No init segment in variant or master - try checking other variants
-        console.warn(
-          "No init segment found in selected variant, checking other variants...",
-        );
         for (let i = 1; i < Math.min(variantPlaylists.length, 5); i++) {
-          // Check up to 5 variants
           try {
             const otherVariantUrl = fixUrlEncoding(variantPlaylists[i].url);
             const otherFetchOptions = await getFetchOptionsWithHeaders(
@@ -852,26 +877,17 @@ async function downloadAndMergeM3U8(
             );
             if (otherResponse.ok) {
               const otherText = await otherResponse.text();
-              const otherBaseUrl = otherVariantUrl.substring(
-                0,
-                otherVariantUrl.lastIndexOf("/") + 1,
+              const otherParsed = parseM3U8(
+                otherText,
+                getBaseUrl(otherVariantUrl),
               );
-              const otherParsed = parseM3U8(otherText, otherBaseUrl);
               if (otherParsed.initSegmentUrl) {
                 initSegmentUrl = otherParsed.initSegmentUrl;
-                console.log(
-                  `Found init segment in variant ${i + 1}:`,
-                  initSegmentUrl,
-                );
                 break;
               }
             }
           } catch (err) {
-            console.warn(
-              `Failed to check variant ${i + 1} for init segment:`,
-              err.message,
-            );
-            // Continue checking other variants
+            dmLog("Variant", i + 1, "init check failed:", err.message);
           }
         }
       }
@@ -879,67 +895,14 @@ async function downloadAndMergeM3U8(
       // Update playlistText for reference
       playlistText = variantText;
     } else {
-      // Direct playlist with segments (not a master playlist)
-      console.log("Direct media playlist detected (not a master playlist)");
-      console.log(
-        `Playlist length: ${playlistText.length} characters, ${playlistText.split("\n").length} lines`,
-      );
-
-      // Log first 50 lines of playlist to see structure
-      const playlistLines = playlistText.split("\n");
-      console.log("=== FIRST 50 LINES OF PLAYLIST ===");
-      playlistLines.slice(0, 50).forEach((line, idx) => {
-        console.log(`Line ${idx + 1}:`, line.substring(0, 200));
-      });
-      console.log("=== END OF FIRST 50 LINES ===");
-
-      // Check for #EXT-X-MAP in the playlist text before parsing (case-insensitive)
-      const upperPlaylist = playlistText.toUpperCase();
-      const hasMapTag = upperPlaylist.includes("#EXT-X-MAP");
-      console.log(
-        `Checking for #EXT-X-MAP in playlist (case-insensitive): ${hasMapTag ? "FOUND" : "NOT FOUND"}`,
-      );
-
-      // Find ALL lines that might be related to init segment
-      const allMapLines = playlistLines.filter((line) => {
-        const upper = line.toUpperCase();
-        return (
-          upper.includes("MAP") ||
-          upper.includes("INIT") ||
-          upper.includes("EXT-X-MAP")
-        );
-      });
-
-      if (allMapLines.length > 0) {
-        console.log(
-          `=== FOUND ${allMapLines.length} POTENTIAL MAP/INIT LINES ===`,
-        );
-        allMapLines.forEach((line, idx) => {
-          console.log(`MAP/INIT line ${idx + 1}:`, line);
-        });
-        console.log("=== END OF MAP/INIT LINES ===");
-      } else {
-        console.warn(
-          "⚠️ No lines containing MAP or INIT found in entire playlist",
-        );
-      }
-
-      const baseUrl = m3u8Url.substring(0, m3u8Url.lastIndexOf("/") + 1);
-      const parsed = parseM3U8(playlistText, baseUrl);
+      const parsed = parseM3U8(playlistText, getBaseUrl(m3u8Url));
       segments = parsed.segments;
       initSegmentUrl = parsed.initSegmentUrl;
-
-      if (initSegmentUrl) {
-        console.log(
-          "✅ Found init segment in direct playlist:",
-          initSegmentUrl,
-        );
-      } else {
+      if (!initSegmentUrl) {
         console.warn(
-          "⚠️ No init segment found in direct playlist despite parsing",
+          "No init segment in direct playlist:",
+          m3u8Url.substring(0, 80),
         );
-        console.warn("Playlist URL was:", m3u8Url);
-        console.warn("Base URL is:", baseUrl);
       }
     }
 
@@ -963,18 +926,18 @@ async function downloadAndMergeM3U8(
       );
 
     if (isMPEGTS) {
-      console.log(
+      dmLog(
         "✅ Detected MPEG-TS playlist (.ts segments) - no init segment needed, segments can be concatenated directly",
       );
     } else if (isFMP4 || initSegmentUrl) {
-      console.log(
+      dmLog(
         "✅ Detected fMP4 playlist - init segment required for QuickTime compatibility",
       );
     } else {
-      console.log("⚠️ Unknown segment format - will attempt to merge segments");
+      dmLog("⚠️ Unknown segment format - will attempt to merge segments");
     }
 
-    console.log(
+    dmLog(
       `Found ${segments.length} segments${initSegmentUrl ? " and init segment" : ""}, downloading...`,
     );
 
@@ -992,7 +955,7 @@ async function downloadAndMergeM3U8(
     if (initSegmentUrl) {
       // Fix init segment URL encoding
       initSegmentUrl = fixUrlEncoding(initSegmentUrl);
-      console.log("Downloading init segment (map URL):", initSegmentUrl);
+      dmLog("Downloading init segment (map URL):", initSegmentUrl);
 
       // Retry init segment download (it's critical for QuickTime compatibility)
       const downloadInitSegmentWithRetry = async (retries = 3) => {
@@ -1028,7 +991,7 @@ async function downloadAndMergeM3U8(
                 throw new Error("Init segment missing ftyp box");
               }
 
-              console.log(
+              dmLog(
                 `Init segment downloaded successfully: ${data.byteLength} bytes (attempt ${attempt + 1}/${retries + 1})`,
               );
               return data;
@@ -1062,7 +1025,7 @@ async function downloadAndMergeM3U8(
 
       try {
         initSegmentData = await downloadInitSegmentWithRetry();
-        console.log(
+        dmLog(
           "✅ Init segment downloaded and validated - QuickTime compatible",
         );
       } catch (initError) {
@@ -1080,7 +1043,7 @@ async function downloadAndMergeM3U8(
       // No init segment URL in playlist
       if (isMPEGTS) {
         // MPEG-TS doesn't need an init segment - this is normal
-        console.log(
+        dmLog(
           "✅ MPEG-TS playlist - no init segment needed, segments will be concatenated directly",
         );
         initSegmentData = null;
@@ -1105,7 +1068,7 @@ async function downloadAndMergeM3U8(
     const segmentData = []; // Store segment data with index for proper ordering
     const failedSegments = []; // Track failed segments for retry
 
-    console.log(
+    dmLog(
       `Downloading ${segments.length} segments in batches of ${batchSize}...`,
     );
 
@@ -1239,7 +1202,7 @@ async function downloadAndMergeM3U8(
         throw new DOMException("Download cancelled", "AbortError");
       }
 
-      console.log(
+      dmLog(
         `Processing batch ${batchNumber}/${totalBatches} (segments ${batchStart + 1}-${batchEnd})...`,
       );
 
@@ -1379,7 +1342,7 @@ async function downloadAndMergeM3U8(
         throw new DOMException("Download cancelled", "AbortError");
       }
 
-      console.log(
+      dmLog(
         `Retrying ${failedSegments.length} failed segments with extended retries...`,
       );
       await chrome.storage.local.set({
@@ -1421,9 +1384,7 @@ async function downloadAndMergeM3U8(
         if (result.status === "fulfilled" && result.value.success) {
           segmentData.push(result.value);
           recoveredCount++;
-          console.log(
-            `Successfully recovered segment ${result.value.index + 1}`,
-          );
+          dmLog(`Successfully recovered segment ${result.value.index + 1}`);
         } else {
           const failed = failedSegments[i];
           // Only log as error if it's not a 503 (server overload is expected sometimes)
@@ -1441,7 +1402,7 @@ async function downloadAndMergeM3U8(
         }
       }
 
-      console.log(
+      dmLog(
         `Recovered ${recoveredCount}/${failedSegments.length} failed segments`,
       );
 
@@ -1481,7 +1442,7 @@ async function downloadAndMergeM3U8(
     }
 
     const successRate = segmentData.length / segments.length;
-    console.log(
+    dmLog(
       `Downloaded ${segmentData.length}/${segments.length} segments (${(successRate * 100).toFixed(1)}%)`,
     );
 
@@ -1587,7 +1548,7 @@ async function downloadAndMergeM3U8(
     }
 
     // Create blobs from successful segments in order
-    console.log(
+    dmLog(
       `Creating blobs from ${orderedSegments.length} segments in correct order...`,
     );
     const segmentBuffers = orderedSegments.map((s) => s.data);
@@ -1626,7 +1587,7 @@ async function downloadAndMergeM3U8(
       segmentBlobs.push(batchBlob);
     }
 
-    console.log("Merging segment batches...");
+    dmLog("Merging segment batches...");
     await chrome.storage.local.set({
       [`downloadProgress_${downloadId}`]: 95,
       [`downloadStatus_${downloadId}`]: "Merging segments...",
@@ -1660,7 +1621,7 @@ async function downloadAndMergeM3U8(
             firstView[7] === 0x70;
 
           if (firstHasFtyp) {
-            console.log(
+            dmLog(
               "✅ First segment contains ftyp box - extracting init data (workaround)",
             );
 
@@ -1689,7 +1650,7 @@ async function downloadAndMergeM3U8(
                     moovSizeBytes[3];
                   moovStart = i - 4;
                   moovEnd = moovStart + moovSize;
-                  console.log(
+                  dmLog(
                     `Found moov atom at offset ${moovStart}, size: ${moovSize} bytes`,
                   );
                   break;
@@ -1701,24 +1662,20 @@ async function downloadAndMergeM3U8(
               // Extract ftyp + moov (everything up to and including moov)
               initSegmentData = firstSegment.slice(0, moovEnd);
               useFirstSegmentAsInit = true;
-              console.log(
-                `Extracted init data: ${moovEnd} bytes (ftyp + moov)`,
-              );
+              dmLog(`Extracted init data: ${moovEnd} bytes (ftyp + moov)`);
 
               // Remove the init portion from first segment to avoid duplication
               if (moovEnd < firstSegment.byteLength) {
                 segmentBuffers[0] = firstSegment.slice(moovEnd);
 
-                // Recreate segmentBlobs since we modified segmentBuffers
                 segmentBlobs.length = 0;
-                for (let i = 0; i < segmentBuffers.length; i += blobBatchSize) {
-                  const batch = segmentBuffers.slice(
-                    i,
-                    Math.min(i + blobBatchSize, segmentBuffers.length),
-                  );
-                  const batchBlob = new Blob(batch, { type: "video/mp4" });
-                  segmentBlobs.push(batchBlob);
-                }
+                segmentBlobs.push(
+                  ...buffersToSegmentBlobs(
+                    segmentBuffers,
+                    blobBatchSize,
+                    "video/mp4",
+                  ),
+                );
               } else {
                 // Init data is entire first segment - create empty buffer for first segment
                 // This keeps the segment count correct
@@ -1727,16 +1684,14 @@ async function downloadAndMergeM3U8(
                   "⚠️ First segment was entirely init data - segment will be empty but count preserved",
                 );
 
-                // Recreate blobs
                 segmentBlobs.length = 0;
-                for (let i = 0; i < segmentBuffers.length; i += blobBatchSize) {
-                  const batch = segmentBuffers.slice(
-                    i,
-                    Math.min(i + blobBatchSize, segmentBuffers.length),
-                  );
-                  const batchBlob = new Blob(batch, { type: "video/mp4" });
-                  segmentBlobs.push(batchBlob);
-                }
+                segmentBlobs.push(
+                  ...buffersToSegmentBlobs(
+                    segmentBuffers,
+                    blobBatchSize,
+                    "video/mp4",
+                  ),
+                );
               }
             } else {
               // Moov not found, use first 200KB as fallback (should contain ftyp + moov)
@@ -1749,33 +1704,27 @@ async function downloadAndMergeM3U8(
 
               if (initSize < firstSegment.byteLength) {
                 segmentBuffers[0] = firstSegment.slice(initSize);
-                // Recreate blobs
                 segmentBlobs.length = 0;
-                for (let i = 0; i < segmentBuffers.length; i += blobBatchSize) {
-                  const batch = segmentBuffers.slice(
-                    i,
-                    Math.min(i + blobBatchSize, segmentBuffers.length),
-                  );
-                  const batchBlob = new Blob(batch, { type: "video/mp4" });
-                  segmentBlobs.push(batchBlob);
-                }
+                segmentBlobs.push(
+                  ...buffersToSegmentBlobs(
+                    segmentBuffers,
+                    blobBatchSize,
+                    "video/mp4",
+                  ),
+                );
               } else {
-                // Init data is entire first segment - create empty buffer
                 segmentBuffers[0] = new ArrayBuffer(0);
                 console.warn(
                   "⚠️ First segment was entirely init data - segment will be empty but count preserved",
                 );
-
-                // Recreate blobs
                 segmentBlobs.length = 0;
-                for (let i = 0; i < segmentBuffers.length; i += blobBatchSize) {
-                  const batch = segmentBuffers.slice(
-                    i,
-                    Math.min(i + blobBatchSize, segmentBuffers.length),
-                  );
-                  const batchBlob = new Blob(batch, { type: "video/mp4" });
-                  segmentBlobs.push(batchBlob);
-                }
+                segmentBlobs.push(
+                  ...buffersToSegmentBlobs(
+                    segmentBuffers,
+                    blobBatchSize,
+                    "video/mp4",
+                  ),
+                );
               }
             }
           } else {
@@ -1814,7 +1763,7 @@ async function downloadAndMergeM3U8(
     // Add init segment if available (either from playlist or extracted from first segment)
     // Skip for MPEG-TS - it doesn't need an init segment
     if (initSegmentData && !isMPEGTS) {
-      console.log("Prepending init segment to merged file...");
+      dmLog("Prepending init segment to merged file...");
       // Validate init segment is not empty
       if (initSegmentData.byteLength === 0) {
         throw new Error(
@@ -1851,13 +1800,11 @@ async function downloadAndMergeM3U8(
         });
       } else {
         if (useFirstSegmentAsInit) {
-          console.log(
+          dmLog(
             "✅ Using first segment as init (workaround) - QuickTime compatible",
           );
         } else {
-          console.log(
-            "✅ Init segment has valid ftyp box - QuickTime compatible",
-          );
+          dmLog("✅ Init segment has valid ftyp box - QuickTime compatible");
         }
       }
       finalBlobs.push(new Blob([initSegmentData], { type: "video/mp4" }));
@@ -1873,7 +1820,7 @@ async function downloadAndMergeM3U8(
       });
     } else {
       // MPEG-TS - no init segment needed, this is normal
-      console.log(
+      dmLog(
         "✅ MPEG-TS format - no init segment needed, concatenating segments directly",
       );
     }
@@ -1919,7 +1866,7 @@ async function downloadAndMergeM3U8(
         finalFilename =
           finalFilename.replace(/\.[^.]*$/, "") + (isMPEGTS ? ".ts" : ".mp4");
       }
-      console.log(
+      dmLog(
         `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"}) — large file (${Math.round(
           totalSizeFromBlobs / 1024 / 1024,
         )}MB), writing segment batches to IDB directly`,
@@ -1928,7 +1875,7 @@ async function downloadAndMergeM3U8(
         await finalBlobs[0].slice(0, 8).arrayBuffer(),
       );
       if (isMPEGTS && header[0] === 0x47) {
-        console.log(
+        dmLog(
           "✅ MPEG-TS structure (sync byte 0x47) — should play in VLC and most players",
         );
       } else if (!isMPEGTS) {
@@ -1945,39 +1892,10 @@ async function downloadAndMergeM3U8(
       inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random()
         .toString(36)
         .slice(2, 9)}`;
-      const db = await new Promise((resolve, reject) => {
-        const req = indexedDB.open("DailymotionDownloaderDB", 1);
-        req.onerror = () => reject(req.error);
-        req.onsuccess = () => resolve(req.result);
-        req.onupgradeneeded = (e) => {
-          if (!e.target.result.objectStoreNames.contains("blobs")) {
-            e.target.result.createObjectStore("blobs");
-          }
-        };
+      const db = await openBlobDB();
+      await putBlobChunksInIDB(db, inputBlobIdForConvert, finalBlobs, {
+        downloadId,
       });
-      for (let i = 0; i < finalBlobs.length; i++) {
-        const buf = await finalBlobs[i].arrayBuffer();
-        await new Promise((resolve, reject) => {
-          const tx = db.transaction(["blobs"], "readwrite");
-          tx.objectStore("blobs").put(
-            buf,
-            `${inputBlobIdForConvert}_chunk_${i}`,
-          );
-          tx.oncomplete = () => resolve();
-          tx.onerror = () => reject(tx.error);
-        });
-        if (i % 15 === 0 && finalBlobs.length > 15) {
-          await chrome.storage.local.set({
-            [`downloadStatus_${downloadId}`]: `Storing for conversion (batch ${i + 1}/${finalBlobs.length})...`,
-          });
-          // Ping offscreen to keep SW alive during long loop (avoids suspension at ~batch 30+)
-          try {
-            await new Promise((resolve) => {
-              chrome.runtime.sendMessage({ action: "ping" }, () => resolve());
-            });
-          } catch (e) {}
-        }
-      }
       db.close();
       chunksOnlyForDownload = {
         blobId: inputBlobIdForConvert,
@@ -2029,7 +1947,7 @@ async function downloadAndMergeM3U8(
         }
       }
 
-      console.log(
+      dmLog(
         `Final filename: ${finalFilename} (format: ${isMPEGTS ? "MPEG-TS" : "fMP4"})`,
       );
 
@@ -2050,7 +1968,7 @@ async function downloadAndMergeM3U8(
         // MPEG-TS validation: Check for sync byte (0x47) at the start
         const hasSyncByte = header[0] === 0x47;
         if (hasSyncByte) {
-          console.log(
+          dmLog(
             "✅ Merged file has valid MPEG-TS structure (sync byte 0x47 found) - should play in VLC and most players",
           );
         } else {
@@ -2078,7 +1996,7 @@ async function downloadAndMergeM3U8(
           throw new Error(errorMsg);
         }
 
-        console.log(
+        dmLog(
           "✅ Merged file has valid MP4 structure - should play in QuickTime and VLC",
         );
         // Use mergedBlob as-is; no need to recreate from full array
@@ -2088,7 +2006,7 @@ async function downloadAndMergeM3U8(
     const sizeMB = Math.round(
       (validatedBlob ? validatedBlob.size : totalSizeFromBlobs) / (1024 * 1024),
     );
-    console.log(`Total merged size: ${sizeMB}MB`);
+    dmLog(`Total merged size: ${sizeMB}MB`);
 
     // Warn about potential playback issues
     if (missingIndices.length > 0) {
@@ -2096,7 +2014,7 @@ async function downloadAndMergeM3U8(
         `⚠️ HLS segments merged with ${missingIndices.length} missing segments - file may have playback issues.`,
       );
     } else {
-      console.log(
+      dmLog(
         "✅ All segments downloaded successfully - video should play correctly in common players",
       );
     }
@@ -2108,161 +2026,218 @@ async function downloadAndMergeM3U8(
     segmentBlobs.length = 0;
     finalBlobs.length = 0;
 
-    const mp4Filename = finalFilename.replace(/\.(ts|mpegts|mkv|webm)$/i, ".mp4");
+    const mp4Filename = finalFilename.replace(
+      /\.(ts|mpegts|mkv|webm)$/i,
+      ".mp4",
+    );
     const alreadyMp4 = /\.mp4$/i.test(finalFilename);
     let converted = false;
     let storedInputInIDB = false;
 
     // Skip conversion when merged output is already MP4 (fMP4) — avoids loading helper iframe and potential hang
-    if (!alreadyMp4) try {
-      await chrome.storage.local.set({
-        [`downloadStatus_${downloadId}`]: "Converting to MP4...",
-      });
-      if (!skippedMergeForLargeFile) {
-        inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
-      }
-      await setupOffscreenDocument();
+    if (!alreadyMp4)
+      try {
+        await chrome.storage.local.set({
+          [`downloadStatus_${downloadId}`]: "Converting to MP4...",
+        });
+        if (!skippedMergeForLargeFile) {
+          inputBlobIdForConvert = `convert_input_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+        }
+        await setupOffscreenDocument();
 
-      if (!skippedMergeForLargeFile) {
-        // Store merged blob in IDB in chunks so the SW never holds the whole blob in memory
-        const CHUNK_SIZE = 32 * 1024 * 1024; // 32MB per chunk
-        const totalSize = validatedBlob.size;
-        const chunkCount = Math.ceil(totalSize / CHUNK_SIZE);
-        try {
-          const db = await new Promise((resolve, reject) => {
-            const req = indexedDB.open("DailymotionDownloaderDB", 1);
-            req.onerror = () => reject(req.error);
-            req.onsuccess = () => resolve(req.result);
-            req.onupgradeneeded = (e) => {
-              if (!e.target.result.objectStoreNames.contains("blobs")) {
-                e.target.result.createObjectStore("blobs");
-              }
-            };
-          });
+        if (!skippedMergeForLargeFile) {
+          const CHUNK_SIZE = 32 * 1024 * 1024; // 32MB per chunk
+          const totalSize = validatedBlob.size;
+          const chunkCount = Math.ceil(totalSize / CHUNK_SIZE);
+          const blobsToStore = [];
           for (let i = 0; i < chunkCount; i++) {
             const start = i * CHUNK_SIZE;
             const end = Math.min(start + CHUNK_SIZE, totalSize);
-            const chunk = validatedBlob.slice(start, end);
-            const chunkBuffer = await chunk.arrayBuffer();
-            const chunkKey = `${inputBlobIdForConvert}_chunk_${i}`;
-            await new Promise((resolve, reject) => {
-              const tx = db.transaction(["blobs"], "readwrite");
-              tx.objectStore("blobs").put(chunkBuffer, chunkKey);
-              tx.oncomplete = () => resolve();
-              tx.onerror = () => reject(tx.error);
-            });
-            if (i % 20 === 0 && chunkCount > 20) {
-              await chrome.storage.local.set({
-                [`downloadStatus_${downloadId}`]: `Storing for conversion (chunk ${i + 1}/${chunkCount})...`,
-              });
-            }
+            blobsToStore.push(validatedBlob.slice(start, end));
           }
-          db.close();
-        } catch (storeErr) {
-          throw new Error(storeErr?.message || "Failed to store blob in IDB");
+          try {
+            const db = await openBlobDB();
+            await putBlobChunksInIDB(db, inputBlobIdForConvert, blobsToStore, {
+              downloadId,
+            });
+            db.close();
+          } catch (storeErr) {
+            throw new Error(storeErr?.message || "Failed to store blob in IDB");
+          }
         }
-      }
 
-      // Offscreen assembles chunks into one blob under inputBlobIdForConvert (or we already have chunks from large-file path)
-      const totalSize = skippedMergeForLargeFile ? chunksOnlyForDownload.totalSize : validatedBlob.size;
-      const chunkCount = skippedMergeForLargeFile ? chunksOnlyForDownload.chunkCount : Math.ceil(totalSize / (32 * 1024 * 1024));
-      const assembleResult = await new Promise((resolve) => {
-        chrome.runtime.sendMessage(
-          {
-            action: "assembleChunksForConvert",
+        // Offscreen assembles chunks into one blob under inputBlobIdForConvert (or we already have chunks from large-file path)
+        const totalSize = skippedMergeForLargeFile
+          ? chunksOnlyForDownload.totalSize
+          : validatedBlob.size;
+        const chunkCount = skippedMergeForLargeFile
+          ? chunksOnlyForDownload.chunkCount
+          : Math.ceil(totalSize / (32 * 1024 * 1024));
+        const assembleResult = await new Promise((resolve) => {
+          chrome.runtime.sendMessage(
+            {
+              action: "assembleChunksForConvert",
+              blobId: inputBlobIdForConvert,
+              chunkCount,
+              totalSize,
+            },
+            (response) => {
+              if (chrome.runtime.lastError)
+                resolve({
+                  success: false,
+                  error: chrome.runtime.lastError.message,
+                });
+              else
+                resolve(response || { success: false, error: "No response" });
+            },
+          );
+        });
+        if (!assembleResult || !assembleResult.success) {
+          chunksOnlyForDownload = {
             blobId: inputBlobIdForConvert,
             chunkCount,
             totalSize,
-          },
-          (response) => {
-            if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
+          };
+          throw new Error(
+            assembleResult?.error || "Failed to assemble chunks in IDB",
+          );
+        }
+        storedInputInIDB = true;
+        // FFmpeg check: ensure FFmpeg is loadable before starting conversion
+        const checkResult = await new Promise((resolve) => {
+          chrome.runtime.sendMessage({ action: "checkFFmpeg" }, (response) => {
+            if (chrome.runtime.lastError)
+              resolve({
+                success: false,
+                error: chrome.runtime.lastError.message,
+              });
             else resolve(response || { success: false, error: "No response" });
-          },
-        );
-      });
-      if (!assembleResult || !assembleResult.success) {
-        chunksOnlyForDownload = { blobId: inputBlobIdForConvert, chunkCount, totalSize };
-        throw new Error(assembleResult?.error || "Failed to assemble chunks in IDB");
-      }
-      storedInputInIDB = true;
-      // FFmpeg check: ensure FFmpeg is loadable before starting conversion
-      const checkResult = await new Promise((resolve) => {
-        chrome.runtime.sendMessage({ action: "checkFFmpeg" }, (response) => {
-          if (chrome.runtime.lastError) resolve({ success: false, error: chrome.runtime.lastError.message });
-          else resolve(response || { success: false, error: "No response" });
+          });
         });
-      });
-      if (!checkResult || !checkResult.success) {
-        const errMsg = checkResult?.error || "FFmpeg is not available";
-        await chrome.storage.local.set({
-          [`downloadProgress_${downloadId}`]: 0,
-          [`downloadStatus_${downloadId}`]: errMsg,
+        if (!checkResult || !checkResult.success) {
+          const errMsg = checkResult?.error || "FFmpeg is not available";
+          await chrome.storage.local.set({
+            [`downloadProgress_${downloadId}`]: 0,
+            [`downloadStatus_${downloadId}`]: errMsg,
+          });
+          throw new Error(errMsg);
+        }
+        const CONVERT_RESPONSE_TIMEOUT_MS = 7 * 60 * 1000;
+        const convertResult = await new Promise((resolve, reject) => {
+          const timeoutId = setTimeout(() => {
+            reject(new Error("Conversion timed out (7 min)"));
+          }, CONVERT_RESPONSE_TIMEOUT_MS);
+          chrome.runtime.sendMessage(
+            {
+              action: "convertToMp4",
+              blobId: inputBlobIdForConvert,
+              downloadId,
+            },
+            (response) => {
+              clearTimeout(timeoutId);
+              if (chrome.runtime.lastError) {
+                reject(new Error(chrome.runtime.lastError.message));
+              } else {
+                resolve(response);
+              }
+            },
+          );
         });
-        throw new Error(errMsg);
-      }
-      const CONVERT_RESPONSE_TIMEOUT_MS = 7 * 60 * 1000;
-      const convertResult = await new Promise((resolve, reject) => {
-        const timeoutId = setTimeout(() => {
-          reject(new Error("Conversion timed out (7 min)"));
-        }, CONVERT_RESPONSE_TIMEOUT_MS);
-        chrome.runtime.sendMessage(
-          { action: "convertToMp4", blobId: inputBlobIdForConvert, downloadId },
-          (response) => {
-            clearTimeout(timeoutId);
-            if (chrome.runtime.lastError) {
-              reject(new Error(chrome.runtime.lastError.message));
-            } else {
-              resolve(response);
-            }
-          },
-        );
-      });
 
-      if (convertResult && convertResult.success && convertResult.outputBlobId) {
-        converted = true;
-        await chrome.storage.local.set({
-          [`downloadProgress_${downloadId}`]: 100,
-          [`downloadStatus_${downloadId}`]: "Saving MP4...",
-        });
-        await downloadBlob(
-          { blobId: convertResult.outputBlobId },
-          mp4Filename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          cleanupIndexedDBBlob,
-          setupOffscreenDocument,
-          blobToDataUrl,
+        if (
+          convertResult &&
+          convertResult.success &&
+          convertResult.outputBlobId
+        ) {
+          converted = true;
+          await chrome.storage.local.set({
+            [`downloadProgress_${downloadId}`]: 100,
+            [`downloadStatus_${downloadId}`]: convertToMp3
+              ? "Converting to MP3..."
+              : "Saving MP4...",
+          });
+          if (convertToMp3) {
+            await convertVideoToMp3AndDownload(
+              convertResult.outputBlobId,
+              "mp4",
+              mp3Filename,
+              downloadId,
+              downloadControllers,
+              activeChromeDownloads,
+              cleanupIndexedDBBlob,
+              setupOffscreenDocument,
+              blobToDataUrl,
+            );
+          } else {
+            await downloadBlob(
+              { blobId: convertResult.outputBlobId },
+              mp4Filename,
+              downloadId,
+              downloadControllers,
+              activeChromeDownloads,
+              cleanupIndexedDBBlob,
+              setupOffscreenDocument,
+              blobToDataUrl,
+            );
+            await chrome.storage.local.set({
+              [`downloadProgress_${downloadId}`]: 100,
+              [`downloadStatus_${downloadId}`]: "Download complete!",
+            });
+          }
+          cleanupIndexedDBBlob(convertResult.outputBlobId);
+        }
+      } catch (convertErr) {
+        console.warn(
+          "Convert to MP4 failed, saving as .ts:",
+          convertErr?.message || convertErr,
         );
-        cleanupIndexedDBBlob(convertResult.outputBlobId);
       }
-    } catch (convertErr) {
-      console.warn("Convert to MP4 failed, saving as .ts:", convertErr?.message || convertErr);
-    }
 
     if (!converted) {
-      let fallbackStatus = "Download complete! (saved as .ts)";
+      let fallbackStatus = convertToMp3
+        ? "Download complete! (saved as .mp3)"
+        : "Download complete! (saved as .ts)";
       await chrome.storage.local.set({
         [`downloadProgress_${downloadId}`]: 100,
-        [`downloadStatus_${downloadId}`]:
-          "Saving as .ts (conversion failed or timed out)...",
+        [`downloadStatus_${downloadId}`]: convertToMp3
+          ? "Converting to MP3..."
+          : "Preparing download...",
       });
       if (storedInputInIDB && inputBlobIdForConvert) {
-        console.log("[downloadM3U8] .ts fallback: using IDB blob", inputBlobIdForConvert);
-        await downloadBlob(
-          { blobId: inputBlobIdForConvert },
-          finalFilename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          cleanupIndexedDBBlob,
-          setupOffscreenDocument,
-          blobToDataUrl,
+        dmLog(
+          "[downloadM3U8] .ts fallback: using IDB blob",
+          inputBlobIdForConvert,
         );
+        if (convertToMp3) {
+          await convertVideoToMp3AndDownload(
+            inputBlobIdForConvert,
+            "ts",
+            mp3Filename,
+            downloadId,
+            downloadControllers,
+            activeChromeDownloads,
+            cleanupIndexedDBBlob,
+            setupOffscreenDocument,
+            blobToDataUrl,
+          );
+        } else {
+          await downloadBlob(
+            { blobId: inputBlobIdForConvert },
+            finalFilename,
+            downloadId,
+            downloadControllers,
+            activeChromeDownloads,
+            cleanupIndexedDBBlob,
+            setupOffscreenDocument,
+            blobToDataUrl,
+          );
+        }
         cleanupIndexedDBBlob(inputBlobIdForConvert);
       } else if (chunksOnlyForDownload) {
         try {
-          console.log("[downloadM3U8] Trying chunked MP4 conversion (500MB parts)...");
+          dmLog(
+            "[downloadM3U8] Trying chunked MP4 conversion (500MB parts)...",
+          );
           await downloadViaChunkedMp4Conversion(
             chunksOnlyForDownload,
             finalFilename,
@@ -2271,12 +2246,18 @@ async function downloadAndMergeM3U8(
             activeChromeDownloads,
             setupOffscreenDocument,
           );
-          fallbackStatus = "Download complete! (MP4 parts)";
-        } catch (chunkedErr) {
-          console.warn("[downloadM3U8] Chunked MP4 failed, saving as single .ts:", chunkedErr.message);
+          fallbackStatus = "Download complete!";
           await chrome.storage.local.set({
-            [`downloadStatus_${downloadId}`]:
-              "Saving as .ts (conversion failed or timed out)...",
+            [`downloadProgress_${downloadId}`]: 100,
+            [`downloadStatus_${downloadId}`]: fallbackStatus,
+          });
+        } catch (chunkedErr) {
+          console.warn(
+            "[downloadM3U8] Chunked MP4 failed, saving as single .ts:",
+            chunkedErr.message,
+          );
+          await chrome.storage.local.set({
+            [`downloadStatus_${downloadId}`]: "Saving as .ts...",
           });
           await downloadViaBlobFromChunks(
             chunksOnlyForDownload,
@@ -2288,17 +2269,44 @@ async function downloadAndMergeM3U8(
           );
         }
       } else {
-        console.log("[downloadM3U8] .ts fallback: using validatedBlob (IDB not used)");
-        await downloadBlob(
-          validatedBlob,
-          finalFilename,
-          downloadId,
-          downloadControllers,
-          activeChromeDownloads,
-          cleanupIndexedDBBlob,
-          setupOffscreenDocument,
-          blobToDataUrl,
+        dmLog(
+          "[downloadM3U8] .ts fallback: using validatedBlob (IDB not used)",
         );
+        if (convertToMp3 && validatedBlob) {
+          const tempBlobId = `mp3_input_${Date.now()}_${Math.random().toString(36).slice(2, 9)}`;
+          const arrayBuffer = await validatedBlob.arrayBuffer();
+          const db = await openBlobDB();
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction([BLOB_STORE], "readwrite");
+            tx.objectStore(BLOB_STORE).put(arrayBuffer, tempBlobId);
+            tx.oncomplete = () => resolve();
+            tx.onerror = () => reject(tx.error);
+          });
+          db.close();
+          await convertVideoToMp3AndDownload(
+            tempBlobId,
+            "ts",
+            mp3Filename,
+            downloadId,
+            downloadControllers,
+            activeChromeDownloads,
+            cleanupIndexedDBBlob,
+            setupOffscreenDocument,
+            blobToDataUrl,
+          );
+          cleanupIndexedDBBlob(tempBlobId);
+        } else {
+          await downloadBlob(
+            validatedBlob,
+            finalFilename,
+            downloadId,
+            downloadControllers,
+            activeChromeDownloads,
+            cleanupIndexedDBBlob,
+            setupOffscreenDocument,
+            blobToDataUrl,
+          );
+        }
       }
       await chrome.storage.local.set({
         [`downloadStatus_${downloadId}`]: fallbackStatus,
@@ -2332,7 +2340,7 @@ async function downloadAndMergeM3U8(
               chrome.runtime.lastError,
             );
           } else {
-            console.log(
+            dmLog(
               "Cleaned up all download storage from downloadM3U8:",
               downloadId,
             );
@@ -2343,7 +2351,7 @@ async function downloadAndMergeM3U8(
   } catch (error) {
     // Check if error is due to cancellation
     if (error.name === "AbortError" || abortController.signal.aborted) {
-      console.log("M3U8 download was cancelled:", downloadId);
+      dmLog("M3U8 download was cancelled:", downloadId);
       await chrome.storage.local.set({
         [`downloadProgress_${downloadId}`]: 0,
         [`downloadStatus_${downloadId}`]: "Download cancelled",
@@ -2367,7 +2375,7 @@ async function downloadAndMergeM3U8(
                 chrome.runtime.lastError,
               );
             } else {
-              console.log(
+              dmLog(
                 "Cleaned up all download storage from downloadM3U8 (cancelled):",
                 downloadId,
               );
@@ -2428,7 +2436,7 @@ async function downloadAndMergeM3U8(
               chrome.runtime.lastError,
             );
           } else {
-            console.log(
+            dmLog(
               "Cleaned up all download storage from downloadM3U8 (error):",
               downloadId,
             );
@@ -2454,7 +2462,7 @@ async function findDailymotionTabId(masterPlaylistUrl, videoData) {
     const tabs = await chrome.tabs.query({ url: "*://*.dailymotion.com/*" });
 
     if (tabs.length === 0) {
-      console.log("No Dailymotion tabs found");
+      dmLog("No Dailymotion tabs found");
       return null;
     }
 
@@ -2466,7 +2474,7 @@ async function findDailymotionTabId(masterPlaylistUrl, videoData) {
         videoData[tab.id].urls.length > 0
       ) {
         // This tab has video data, use it
-        console.log("Found tab with video data:", tab.id, tab.url);
+        dmLog("Found tab with video data:", tab.id, tab.url);
         return tab.id;
       }
     }
@@ -2474,11 +2482,7 @@ async function findDailymotionTabId(masterPlaylistUrl, videoData) {
     // If no tab has video data yet, use the active tab or first tab
     const activeTab = tabs.find((tab) => tab.active) || tabs[0];
     if (activeTab) {
-      console.log(
-        "Using active/first Dailymotion tab:",
-        activeTab.id,
-        activeTab.url,
-      );
+      dmLog("Using active/first Dailymotion tab:", activeTab.id, activeTab.url);
       return activeTab.id;
     }
 
@@ -2489,394 +2493,4 @@ async function findDailymotionTabId(masterPlaylistUrl, videoData) {
   }
 }
 
-/**
- * Fetch and parse HLS master playlist to extract all quality variants
- * @param {number} tabId - The tab ID
- * @param {string} masterPlaylistUrl - The master playlist URL
- * @param {string|null} providedVideoId - Optional video ID
- * @param {string|null} providedVideoTitle - Optional video title
- * @param {Object} videoData - Video data object
- * @param {Function} storeVideoUrl - Function to store video URLs
- * @param {Set} parsingHLSVariants - Set to track parsing state
- * @returns {Promise<void>}
- */
-async function parseAndStoreHLSVariants(
-  tabId,
-  masterPlaylistUrl,
-  providedVideoId = null,
-  providedVideoTitle = null,
-  videoData,
-  storeVideoUrl,
-  parsingHLSVariants,
-) {
-  // Fix URL encoding first for deduplication
-  const normalizedUrl = fixUrlEncoding(masterPlaylistUrl);
-
-  // Prevent duplicate parsing of the same playlist
-  if (parsingHLSVariants.has(normalizedUrl)) {
-    console.log(
-      "Already parsing HLS variants for this URL, skipping:",
-      normalizedUrl.substring(0, 80) + "...",
-    );
-    return;
-  }
-
-  // Mark as being parsed
-  parsingHLSVariants.add(normalizedUrl);
-
-  // Auto-remove from set after 30 seconds to prevent permanent blocking
-  setTimeout(() => {
-    parsingHLSVariants.delete(normalizedUrl);
-  }, 30000);
-
-  try {
-    console.log("Parsing HLS variants from:", normalizedUrl);
-
-    // If tabId is invalid (-1), try to find the correct tab
-    if (!tabId || tabId < 0) {
-      console.log("Invalid tabId, trying to find correct Dailymotion tab...");
-      const foundTabId = await findDailymotionTabId(normalizedUrl, videoData);
-      if (foundTabId) {
-        tabId = foundTabId;
-        console.log("Found correct tabId:", tabId);
-      } else {
-        console.warn(
-          "Could not find valid tabId for HLS variants, skipping storage",
-        );
-        parsingHLSVariants.delete(normalizedUrl);
-        return;
-      }
-    }
-
-    // Use normalized URL
-    masterPlaylistUrl = normalizedUrl;
-
-    // Get fetch options with headers
-    let fetchOptions;
-    try {
-      fetchOptions = await getFetchOptionsWithHeaders(masterPlaylistUrl, tabId);
-    } catch (error) {
-      console.warn("Failed to get fetch options for master playlist:", error);
-      // Try with minimal options
-      fetchOptions = {
-        method: "GET",
-        headers: {
-          "User-Agent":
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-          Accept: "*/*",
-          "Accept-Language": "en-US,en;q=0.9",
-        },
-      };
-    }
-
-    // Fetch the master playlist with retry logic
-    let response;
-    try {
-      response = await fetch(masterPlaylistUrl, fetchOptions);
-      if (!response.ok) {
-        console.warn(
-          "Failed to fetch master playlist for variant extraction:",
-          response.status,
-          response.statusText,
-        );
-        return;
-      }
-    } catch (error) {
-      console.error(
-        "Network error fetching master playlist:",
-        error.message || error,
-      );
-
-      // If fetch fails, it might be a CORS issue or network problem
-      // The master playlist might have already been fetched by the network request listener
-      // Check if we already have this URL stored
-      if (videoData[tabId] && videoData[tabId].urls) {
-        const existingMaster = videoData[tabId].urls.find(
-          (v) =>
-            v.url === masterPlaylistUrl ||
-            (v.type &&
-              v.type.includes("hls-master") &&
-              v.url.includes(".m3u8")),
-        );
-
-        if (existingMaster) {
-          console.log("Master playlist already stored, skipping fetch");
-          // The variants might already be parsed, or we can try to parse from stored data
-          // For now, just return - the variants will be parsed when the playlist is actually fetched
-          return;
-        }
-      }
-
-      // Try one more time with a simpler request (no cookies/headers)
-      try {
-        console.log("Retrying with simpler fetch options...");
-        response = await fetch(masterPlaylistUrl, {
-          method: "GET",
-          headers: {
-            "User-Agent":
-              "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-          },
-        });
-        if (!response.ok) {
-          console.warn(
-            "Retry also failed:",
-            response.status,
-            response.statusText,
-          );
-          return;
-        }
-      } catch (retryError) {
-        console.error("Retry also failed:", retryError.message || retryError);
-        // Don't throw - this is a background operation, just log and return
-        return;
-      }
-    }
-
-    const playlistText = await response.text();
-    console.log("Master playlist fetched, length:", playlistText.length);
-
-    const hasVideoVariants =
-      playlistText && playlistText.includes("#EXT-X-STREAM-INF");
-    const hasAudioMedia =
-      playlistText && /#EXT-X-MEDIA:.*TYPE=AUDIO/i.test(playlistText);
-
-    if (!hasVideoVariants && !hasAudioMedia) {
-      console.log(
-        "Not a master playlist (no EXT-X-STREAM-INF or EXT-X-MEDIA TYPE=AUDIO)",
-      );
-      return;
-    }
-
-    // Parse the base URL
-    const baseUrl = masterPlaylistUrl.substring(
-      0,
-      masterPlaylistUrl.lastIndexOf("/") + 1,
-    );
-
-    const variants = hasVideoVariants
-      ? parseMasterPlaylist(playlistText, baseUrl)
-      : [];
-    const audioTracks = hasAudioMedia
-      ? parseMasterPlaylistAudio(playlistText, baseUrl)
-      : [];
-
-    if (variants.length > 0) {
-      console.log(
-        `Found ${variants.length} HLS variants:`,
-        variants.map((v) => ({
-          resolution: v.resolution,
-          bandwidth: v.bandwidth,
-          url: v.url.substring(0, 60) + "...",
-        })),
-      );
-    }
-    if (audioTracks.length > 0) {
-      console.log(
-        `Found ${audioTracks.length} audio track(s):`,
-        audioTracks.map((a) => ({
-          name: a.name,
-          url: a.url.substring(0, 60) + "...",
-        })),
-      );
-    }
-
-    if (variants.length === 0 && audioTracks.length === 0) {
-      console.log("No video variants or audio tracks found in master playlist");
-      return;
-    }
-
-    // Ensure videoData exists for this tab
-    if (!videoData[tabId]) {
-      videoData[tabId] = {
-        urls: [],
-        activeUrl: null,
-        videoTitle: null,
-        videoIds: {},
-      };
-    }
-
-    // Check if variants from this playlist are already stored (prevent duplicate parsing)
-    // Extract a unique identifier from the playlist URL (psid or similar)
-    const psidMatch = masterPlaylistUrl.match(/psid=([^&\/]+)/);
-    if (psidMatch && videoData[tabId].urls.length > 0) {
-      const psid = psidMatch[1];
-      const existingVariants = videoData[tabId].urls.filter(
-        (v) =>
-          v.type &&
-          v.type.startsWith("hls-") &&
-          v.type !== "hls-master" &&
-          v.url.includes(psid),
-      );
-      if (existingVariants.length >= 3) {
-        // If we already have 3+ variants with this psid, skip parsing
-        console.log(
-          `Variants from this playlist already stored (${existingVariants.length} variants found), skipping parse`,
-        );
-        parsingHLSVariants.delete(normalizedUrl);
-        return;
-      }
-    }
-
-    // Extract videoId and videoTitle - prioritize provided values
-    let videoId = providedVideoId;
-    let videoTitle = providedVideoTitle;
-
-    // If videoId was provided, get title from videoIds map if not provided
-    if (
-      videoId &&
-      !videoTitle &&
-      videoData[tabId].videoIds &&
-      videoData[tabId].videoIds[videoId]
-    ) {
-      videoTitle = videoData[tabId].videoIds[videoId].title;
-      console.log(
-        "Got videoTitle from videoIds map for provided videoId:",
-        videoId,
-        "title:",
-        videoTitle,
-      );
-    }
-
-    // If no videoId provided, try to find it from most recent URLs (prefer recent over old)
-    if (!videoId) {
-      // Sort URLs by timestamp (most recent first) and find first with videoId
-      const sortedUrls = [...videoData[tabId].urls].sort(
-        (a, b) => (b.timestamp || 0) - (a.timestamp || 0),
-      );
-      const recentVideo = sortedUrls.find((v) => v.videoId);
-      if (recentVideo) {
-        videoId = recentVideo.videoId;
-        videoTitle = recentVideo.videoTitle;
-        console.log("Found videoId from most recent URLs:", videoId);
-      }
-    }
-
-    // If still no videoId, try to get it from videoIds map (most recent key)
-    if (!videoId && videoData[tabId].videoIds) {
-      const videoIdKeys = Object.keys(videoData[tabId].videoIds);
-      if (videoIdKeys.length > 0) {
-        // Use the most recently added videoId (last key, or we could track timestamps)
-        // For now, prefer the one with a title
-        const videoIdWithTitle = videoIdKeys.find(
-          (id) => videoData[tabId].videoIds[id]?.title,
-        );
-        videoId = videoIdWithTitle || videoIdKeys[videoIdKeys.length - 1];
-        videoTitle = videoData[tabId].videoIds[videoId]?.title || videoTitle;
-        console.log("Found videoId from videoIds map:", videoId);
-      }
-    }
-
-    // If still no videoId, try to get it from the tab's URL (async)
-    if (!videoId && tabId) {
-      try {
-        const tab = await new Promise((resolve) => {
-          chrome.tabs.get(tabId, (tab) => {
-            if (chrome.runtime.lastError) {
-              resolve(null);
-            } else {
-              resolve(tab);
-            }
-          });
-        });
-
-        if (tab && tab.url) {
-          const tabVideoId = extractVideoId(tab.url);
-          if (tabVideoId) {
-            videoId = tabVideoId;
-            // Get title from videoIds map if available
-            if (
-              videoData[tabId].videoIds &&
-              videoData[tabId].videoIds[videoId]
-            ) {
-              videoTitle = videoData[tabId].videoIds[videoId].title;
-            }
-            console.log("Found videoId from tab URL:", videoId);
-          }
-        }
-      } catch (e) {
-        console.warn("Error getting tab URL for videoId:", e);
-      }
-    }
-
-    // Last resort: try to extract from master playlist URL (unlikely to work)
-    if (!videoId) {
-      videoId = extractVideoId(masterPlaylistUrl);
-      console.log(
-        "Tried extracting videoId from master playlist URL:",
-        videoId,
-      );
-    }
-
-    console.log(
-      "Using videoId for variants:",
-      videoId,
-      "videoTitle:",
-      videoTitle,
-    );
-
-    // If we still don't have a videoId, we can't properly group the variants
-    // But we'll still store them - they might get matched later
-    if (!videoId) {
-      console.warn(
-        "Warning: No videoId found for HLS variants. They may not group correctly in the popup.",
-      );
-    }
-
-    // Store each video variant with quality information
-    let storedCount = 0;
-    variants.forEach((variant, index) => {
-      // Extract quality from resolution (e.g., "1920x1080" -> "1080p")
-      let quality = null;
-      if (variant.resolution && variant.resolution !== "unknown") {
-        const resolutionMatch = variant.resolution.match(/(\d+)x(\d+)/);
-        if (resolutionMatch) {
-          const height = parseInt(resolutionMatch[2]);
-          quality = height;
-        }
-      }
-
-      // If no resolution, try to infer from bandwidth (rough estimate)
-      if (!quality && variant.bandwidth) {
-        // Rough mapping: 240p ~500k, 360p ~1M, 480p ~2M, 720p ~4M, 1080p ~8M
-        if (variant.bandwidth < 800000) quality = 240;
-        else if (variant.bandwidth < 1500000) quality = 360;
-        else if (variant.bandwidth < 3000000) quality = 480;
-        else if (variant.bandwidth < 6000000) quality = 720;
-        else quality = 1080;
-      }
-
-      // Create type string with quality info
-      const type = quality ? `hls-${quality}p` : `hls-variant-${index + 1}`;
-
-      // Store the variant URL with videoId and videoTitle
-      storeVideoUrl(tabId, variant.url, type, false, videoTitle, videoId);
-      storedCount++;
-      console.log(
-        `Stored HLS variant ${storedCount}/${variants.length}: ${quality ? quality + "p" : "variant " + (index + 1)} (videoId: ${videoId}) - ${variant.url.substring(0, 80)}...`,
-      );
-    });
-
-    // Store each audio track (EXT-X-MEDIA TYPE=AUDIO)
-    audioTracks.forEach((track, index) => {
-      const type =
-        audioTracks.length > 1
-          ? `hls-audio-${track.name.replace(/\s+/g, "_")}`
-          : "hls-audio";
-      storeVideoUrl(tabId, track.url, type, false, videoTitle, videoId);
-      storedCount++;
-      console.log(
-        `Stored HLS audio ${index + 1}/${audioTracks.length}: ${track.name} (videoId: ${videoId}) - ${track.url.substring(0, 80)}...`,
-      );
-    });
-
-    console.log(
-      `Successfully stored ${storedCount} HLS variant(s) and audio for tab ${tabId}`,
-    );
-  } catch (error) {
-    console.error("Failed to parse HLS master playlist for variants:", error);
-    // Don't throw - this is a background operation, failure shouldn't break the extension
-  } finally {
-    // Always remove from parsing set when done
-    parsingHLSVariants.delete(normalizedUrl);
-  }
-}
+// parseAndStoreHLSVariants moved to configParser.js — master M3U8 is parsed from config there.
