@@ -24,9 +24,11 @@ const copyFiles = [
   { src: 'popup/popup.html', dest: 'popup/popup.html' },
   { src: 'popup/popup.css', dest: 'popup/popup.css' },
   { src: 'background/offscreen.html', dest: 'background/offscreen.html' },
+  { src: 'ffmpeg-helper-umd.cjs', dest: 'ffmpeg-helper-umd.cjs' },
   { src: 'icons/icon16.png', dest: 'icons/icon16.png' },
   { src: 'icons/icon48.png', dest: 'icons/icon48.png' },
-  { src: 'icons/icon128.png', dest: 'icons/icon128.png' }
+  { src: 'icons/icon128.png', dest: 'icons/icon128.png' },
+  { src: 'assets/feed-download-icon.png', dest: 'assets/feed-download-icon.png' }
 ];
 
 async function minifyFile(inputPath, outputPath) {

@@ -179,16 +179,10 @@ function wakeServiceWorkerAndGetData(tabId, expectedVideoId) {
 
         console.log(videoData, "[popup] videoData");
 
-        // Check if we have videos for current page
         const hasVideos = videoData.urls && videoData.urls.length > 0;
-        const hasCurrentPageVideos =
-          hasVideos && hasVideosForCurrentPage(videoData, expectedVideoId);
 
-        // If no videos or no videos for current page, retry with exponential backoff
-        if (
-          !hasCurrentPageVideos &&
-          popupRetryCount < RETRY_CONFIG.MAX_RETRIES
-        ) {
+        // If no videos, retry with exponential backoff
+        if (!hasVideos && popupRetryCount < RETRY_CONFIG.MAX_RETRIES) {
           handleRetry(expectedVideoId);
           return;
         }
@@ -198,31 +192,6 @@ function wakeServiceWorkerAndGetData(tabId, expectedVideoId) {
         displayVideosWithTitle(videoData, tabId);
       },
     );
-  });
-}
-
-/**
- * Check if video data has videos for the current page
- */
-function hasVideosForCurrentPage(videoData, expectedVideoId) {
-  if (!videoData.urls || videoData.urls.length === 0) {
-    return false;
-  }
-
-  if (!expectedVideoId) {
-    // If no video ID, check for very recent videos (within last 30 seconds)
-    const now = Date.now();
-    const recentThreshold = now - 30000;
-    return videoData.urls.some(
-      (v) => v.timestamp && v.timestamp > recentThreshold,
-    );
-  }
-
-  // Check for videos matching current video ID
-  const normalizedExpectedId = String(expectedVideoId);
-  return videoData.urls.some((v) => {
-    if (!v.videoId) return false;
-    return String(v.videoId) === normalizedExpectedId;
   });
 }
 
@@ -536,116 +505,7 @@ function displayVideos(videoData) {
     videosByPage[videoId].push(video);
   });
 
-  // Separate current page videos from all other pages
-  let currentPageVideos = [];
-  let allOtherPagesVideos = [];
-
-  // Simple strategy: Videos matching currentVideoId are "Current Page", everything else is "Other Pages"
-  const currentPageSet = new Set();
-  const now = Date.now();
-  const veryRecentThreshold = now - 30000; // 30 seconds - very recent videos are likely from current page
-
-  if (currentVideoId) {
-    // Normalize currentVideoId to string for comparison
-    const normalizedCurrentVideoId = String(currentVideoId);
-
-    // If we have a currentVideoId, only videos with that videoId are "Current Page"
-    reliableUrls.forEach((v) => {
-      // Normalize videoId to string for comparison
-      const normalizedVideoId = v.videoId ? String(v.videoId) : null;
-      if (normalizedVideoId === normalizedCurrentVideoId) {
-        currentPageSet.add(v.url);
-      }
-    });
-
-    // Fallback: If no videos matched currentVideoId, use very recent network request videos
-    // This handles cases where videos are detected before videoId is set, or videoId extraction failed
-    if (currentPageSet.size === 0) {
-      const veryRecentVideos = reliableUrls
-        .filter(
-          (v) =>
-            v.fromNetworkRequest &&
-            v.timestamp &&
-            v.timestamp > veryRecentThreshold,
-        )
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-      if (veryRecentVideos.length > 0) {
-        // Add the most recent video and all videos with the same videoId (if any)
-        const mostRecent = veryRecentVideos[0];
-        currentPageSet.add(mostRecent.url);
-        if (mostRecent.videoId) {
-          reliableUrls.forEach((v) => {
-            if (v.videoId === mostRecent.videoId) {
-              currentPageSet.add(v.url);
-            }
-          });
-        } else {
-          // If no videoId, add other very recent videos (they're likely from the same page)
-          veryRecentVideos.slice(0, 10).forEach((v) => {
-            currentPageSet.add(v.url);
-          });
-        }
-        console.log(
-          "No videos matched currentVideoId, using very recent videos as fallback",
-        );
-      }
-    }
-
-    // Also include active videos (they're definitely from current page)
-    const activeVideos = reliableUrls.filter((v) => v.active);
-    activeVideos.forEach((v) => currentPageSet.add(v.url));
-  } else {
-    // If no currentVideoId, use active videos as fallback
-    const activeVideos = reliableUrls.filter((v) => v.active);
-    activeVideos.forEach((v) => currentPageSet.add(v.url));
-
-    // If still no videos, use most recent network request video
-    if (currentPageSet.size === 0) {
-      const recentNetworkVideos = reliableUrls
-        .filter((v) => v.fromNetworkRequest && v.timestamp)
-        .sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
-
-      if (recentNetworkVideos.length > 0) {
-        const mostRecent = recentNetworkVideos[0];
-        currentPageSet.add(mostRecent.url);
-        // Add all videos with same videoId
-        if (mostRecent.videoId) {
-          reliableUrls.forEach((v) => {
-            if (v.videoId === mostRecent.videoId) {
-              currentPageSet.add(v.url);
-            }
-          });
-        }
-      }
-    }
-  }
-
-  // Separate into current page and other pages
-  currentPageVideos = reliableUrls.filter((v) => currentPageSet.has(v.url));
-  allOtherPagesVideos = reliableUrls.filter((v) => !currentPageSet.has(v.url));
-
   container.innerHTML = "";
-
-  // Function to render a section header
-  const renderSectionHeader = (title, isFirst = false) => {
-    const header = document.createElement("div");
-    header.className = "section-header";
-    header.style.cssText = `
-      margin-top: ${isFirst ? "0" : "24px"};
-      margin-bottom: 16px;
-      padding: 12px 16px;
-      background: #f8f9fa;
-      border-left: 4px solid #667eea;
-      border-radius: 6px;
-    `;
-    header.innerHTML = `
-      <div style="font-size: 13px; font-weight: 600; color: #333;">
-        ${title}
-      </div>
-    `;
-    container.appendChild(header);
-  };
 
   // Function to group videos by videoId (same video, different qualities)
   const groupVideosByVideoId = (videos) => {
@@ -673,8 +533,10 @@ function displayVideos(videoData) {
     const groupedVideos = groupVideosByVideoId(videos);
 
     // Render each group (each unique video with its quality options)
-    Object.keys(groupedVideos).forEach((videoKey) => {
+    const videoKeys = Object.keys(groupedVideos);
+    videoKeys.forEach((videoKey, index) => {
       const videoGroup = groupedVideos[videoKey];
+      const isFirst = index === 0;
 
       // Sort qualities: prefer MP4 over HLS, then by quality
       const sortedQualities = videoGroup.sort((a, b) => {
@@ -688,18 +550,19 @@ function displayVideos(videoData) {
         return qualityB - qualityA;
       });
 
-      // Deduplicate by URL only: show all variants (multiple 1080p HLS streams are different bitrates)
-      const uniqueByUrl = new Map();
+      // Deduplicate by quality label so revisiting the same video doesn't duplicate rows (keep one per 720p, 480p, MP3, etc.)
+      const uniqueByQualityLabel = new Map();
       sortedQualities.forEach((video) => {
         if (!video || !video.url) return;
-        if (!uniqueByUrl.has(video.url)) {
-          uniqueByUrl.set(video.url, video);
+        const label = formatQualityLabel(video);
+        // Prefer first occurrence (already sorted: MP4 first, then by quality); skip if we already have this label
+        if (!uniqueByQualityLabel.has(label)) {
+          uniqueByQualityLabel.set(label, video);
         }
       });
-      const uniqueQualities = uniqueByUrl;
 
       // Convert map back to array and sort: prefer MP4 over HLS, then by quality (highest first)
-      const deduplicatedQualities = Array.from(uniqueQualities.values()).sort(
+      const deduplicatedQualities = Array.from(uniqueByQualityLabel.values()).sort(
         (a, b) => {
           if (!a || !b) return 0; // Safety check
 
@@ -741,20 +604,11 @@ function displayVideos(videoData) {
         return; // Skip this group if firstVideo is invalid
       }
 
-      // Get title for this specific video - NEVER use defaultVideoTitle for other videos
-      // Only use defaultVideoTitle if this video matches the current page's videoId
       let displayTitle = null;
 
-      // Normalize videoId to string for lookup
       const videoIdForLookup = firstVideo.videoId
         ? String(firstVideo.videoId)
         : null;
-
-      // Check if this video belongs to the current page
-      const isCurrentPageVideo =
-        currentVideoId &&
-        videoIdForLookup &&
-        String(currentVideoId) === videoIdForLookup;
 
       // Try to get title from videoId mapping first (most reliable)
       // This ensures each video group uses its own videoId's title
@@ -809,14 +663,8 @@ function displayVideos(videoData) {
         }
       }
 
-      // ONLY use defaultVideoTitle as last resort AND only for current page videos
-      // This prevents other videos from showing the wrong title
       if (!displayTitle) {
-        if (isCurrentPageVideo) {
-          displayTitle = defaultVideoTitle;
-        } else {
-          displayTitle = "Video";
-        }
+        displayTitle = defaultVideoTitle || "Video";
       }
       // Never show "Dailymotion Video" in dropdown – use cleaned title or "Video"
       displayTitle = (
@@ -832,242 +680,113 @@ function displayVideos(videoData) {
         displayTitle = "Video";
       }
 
-      // Create video item
+      // Create expandable video item with per-quality rows (name, format, tag, Download, Copy)
       const item = document.createElement("div");
       item.className = "video-item";
 
-      // Generate quality dropdown menu items
-      // Use URL as primary identifier since object references might not match
-      let qualityMenuItems = "";
+      const escapeAttr = (s) =>
+        (s || "").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+      let qualityRowsHtml = "";
+
+      const cell = (cls, content) =>
+        content
+          ? `<span class="${cls}">${escapeAttr(content)}</span>`
+          : `<span class="${cls}"></span>`;
+
       deduplicatedQualities.forEach((video, idx) => {
-        if (!video || !video.url) return; // Skip invalid videos
+        if (!video || !video.url) return;
         const qualityLabel = formatQualityLabel(video);
-        // Find index by URL (more reliable than object reference)
+        const tag =
+          typeof getQualityTag === "function"
+            ? getQualityTag(qualityLabel)
+            : null;
         const videoIndex = videoData.urls.findIndex((v) => v.url === video.url);
-        qualityMenuItems += `<div class="quality-menu-item" data-index="${idx}" data-url="${video.url}" data-video-index="${videoIndex >= 0 ? videoIndex : ""}">${qualityLabel}</div>`;
+        const typeLabel = formatTypeLabel(video.type);
+        qualityRowsHtml += `
+          <div class="quality-row" data-url="${escapeAttr(video.url)}" data-index="${videoIndex >= 0 ? videoIndex : ""}" data-type="${escapeAttr(video.type)}" data-quality-label="${escapeAttr(qualityLabel)}" data-display-title="${escapeAttr(displayTitle)}" data-convert-mp3="0">
+            ${cell("quality-name", qualityLabel)}
+            ${cell("quality-format", typeLabel)}
+            ${tag ? `<span class="quality-tag-pill">${escapeAttr(tag)}</span>` : '<span class="quality-tag-pill"></span>'}
+            <div class="quality-row-actions">
+              <button type="button" class="quality-download-btn" data-url="${escapeAttr(video.url)}" data-index="${videoIndex >= 0 ? videoIndex : ""}" data-type="${escapeAttr(video.type)}" data-quality-label="${escapeAttr(qualityLabel)}" data-display-title="${escapeAttr(displayTitle)}">Download</button>
+              <button type="button" class="quality-copy-btn" data-url="${escapeAttr(video.url)}">Copy</button>
+            </div>
+          </div>`;
       });
-      // Add MP3 option (uses lowest quality video, then convert to MP3)
+
       const lowestQuality =
         deduplicatedQualities[deduplicatedQualities.length - 1];
       if (lowestQuality && lowestQuality.url) {
         const lowestVideoIndex = videoData.urls.findIndex(
           (v) => v.url === lowestQuality.url,
         );
-        qualityMenuItems += `<div class="quality-menu-item" data-convert-mp3="1" data-url="${lowestQuality.url}" data-video-index="${lowestVideoIndex >= 0 ? lowestVideoIndex : ""}">MP3</div>`;
+        qualityRowsHtml += `
+          <div class="quality-row" data-url="${escapeAttr(lowestQuality.url)}" data-index="${lowestVideoIndex >= 0 ? lowestVideoIndex : ""}" data-type="${escapeAttr(lowestQuality.type)}" data-quality-label="MP3" data-display-title="${escapeAttr(displayTitle)}" data-convert-mp3="1">
+            ${cell("quality-name", "MP3")}
+            ${cell("quality-format", "320kbps")}
+            <span class="quality-tag-pill">HQ</span>
+            <div class="quality-row-actions">
+              <button type="button" class="quality-download-btn" data-url="${escapeAttr(lowestQuality.url)}" data-index="${lowestVideoIndex >= 0 ? lowestVideoIndex : ""}" data-type="${escapeAttr(lowestQuality.type)}" data-quality-label="MP3" data-display-title="${escapeAttr(displayTitle)}" data-convert-mp3="1">Download</button>
+              <button type="button" class="quality-copy-btn" data-url="${escapeAttr(lowestQuality.url)}">Copy</button>
+            </div>
+          </div>`;
       }
-
-      // Get default selected video (should exist due to check above, but add safety check)
-      const defaultVideo = deduplicatedQualities[0];
-      if (!defaultVideo) {
-        console.warn("defaultVideo is undefined for videoKey:", videoKey);
-        return; // Skip this group if defaultVideo is invalid
-      }
-      const defaultTypeLabel = formatTypeLabel(defaultVideo.type);
-      const defaultShortUrl =
-        defaultVideo.url.length > 80
-          ? defaultVideo.url.substring(0, 80) + "..."
-          : defaultVideo.url;
-      const defaultQualityLabel = formatQualityLabel(defaultVideo);
 
       item.innerHTML = `
-        <div class="video-header">
-          <div>
-            <div class="video-title">${displayTitle}</div>
-          </div>
+        <div class="video-header expandable-header" role="button" tabindex="0" aria-expanded="${isFirst}">
+          <div class="video-title">${escapeAttr(displayTitle)}</div>
+          <span class="expand-chevron" aria-hidden="true">▼</span>
         </div>
-        <div class="video-url" title="${defaultVideo.url}">${defaultShortUrl}</div>
-      <div class="button-group">
-          <div class="download-button-group">
-            <button class="download-btn" data-url="${defaultVideo.url}" data-index="${videoData.urls.findIndex((v) => v.url === defaultVideo.url)}" data-quality-label="${defaultQualityLabel}" data-display-title="${displayTitle.replace(/"/g, "&quot;")}">
-              Download
-            </button>
-            <button class="download-dropdown-btn" aria-label="Select quality">
-              <svg width="12" height="12" viewBox="0 0 12 12" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <path d="M3 4.5L6 7.5L9 4.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-              </svg>
-        </button>
-            <div class="quality-dropdown-menu">
-              ${qualityMenuItems}
-            </div>
-          </div>
-          <button class="copy-btn" data-url="${defaultVideo.url}">
-            Copy
-        </button>
-      </div>
-    `;
+        <div class="video-qualities">
+          ${qualityRowsHtml}
+        </div>
+      `;
 
+      if (isFirst) item.classList.add("expanded");
       container.appendChild(item);
 
-      // Get elements
-      const videoUrlDiv = item.querySelector(".video-url");
-      const downloadBtn = item.querySelector(".download-btn");
-      const copyBtn = item.querySelector(".copy-btn");
-      const dropdownBtn = item.querySelector(".download-dropdown-btn");
-      const qualityMenu = item.querySelector(".quality-dropdown-menu");
-
-      // Toggle dropdown menu
-      if (dropdownBtn && qualityMenu) {
-        dropdownBtn.addEventListener("click", (e) => {
-          e.preventDefault();
+      const header = item.querySelector(".expandable-header");
+      if (header) {
+        header.addEventListener("click", (e) => {
           e.stopPropagation();
-          // Close all other dropdowns and remove their z-index
-          document
-            .querySelectorAll(".quality-dropdown-menu")
-            .forEach((menu) => {
-              if (menu !== qualityMenu) {
-                menu.classList.remove("show");
-                const otherItem = menu.closest(".video-item");
-                if (otherItem) {
-                  otherItem.classList.remove("dropdown-open");
-                }
-              }
-            });
-          const isShowing = qualityMenu.classList.contains("show");
-          if (isShowing) {
-            qualityMenu.classList.remove("show");
-            item.classList.remove("dropdown-open");
-          } else {
-            qualityMenu.classList.add("show");
-            item.classList.add("dropdown-open"); // Add class to video item for z-index
-          }
-        });
-      }
-
-      // Close dropdown when clicking outside
-      document.addEventListener("click", (e) => {
-        if (!item.contains(e.target)) {
-          qualityMenu.classList.remove("show");
-          item.classList.remove("dropdown-open");
-        }
-      });
-
-      // Handle quality selection
-      qualityMenu.querySelectorAll(".quality-menu-item").forEach((menuItem) => {
-        menuItem.addEventListener("click", (e) => {
-          e.stopPropagation();
-
-          // Get URL directly from data attribute (most reliable)
-          const selectedUrl = menuItem.dataset.url;
-          if (!selectedUrl) {
-            console.error("No URL found in quality menu item:", menuItem);
-            return;
-          }
-
-          const isMp3Option = menuItem.dataset.convertMp3 === "1";
-          if (isMp3Option) {
-            downloadBtn.dataset.convertMp3 = "true";
-          } else {
-            delete downloadBtn.dataset.convertMp3;
-          }
-
-          // Find the actual video object from videoData.urls by URL (more reliable than index)
-          let selectedVideo = videoData.urls.find((v) => v.url === selectedUrl);
-          if (!selectedVideo) {
-            // Fallback: try using index from deduplicatedQualities
-            const selectedIndex = parseInt(menuItem.dataset.index);
-            if (
-              selectedIndex >= 0 &&
-              selectedIndex < deduplicatedQualities.length
-            ) {
-              const fallbackVideo = deduplicatedQualities[selectedIndex];
-              if (fallbackVideo && fallbackVideo.url === selectedUrl) {
-                // Found it in deduplicatedQualities, now find in videoData.urls by URL
-                selectedVideo = videoData.urls.find(
-                  (v) => v.url === selectedUrl,
-                );
-              }
-            }
-            if (!selectedVideo) {
-              console.error("Could not find video for URL:", selectedUrl);
-              return;
-            }
-          }
-
-          const qualityLabel = isMp3Option
-            ? "MP3"
-            : formatQualityLabel(selectedVideo);
-
-          // Update displayed URL
-          const shortUrl =
-            selectedVideo.url.length > 80
-              ? selectedVideo.url.substring(0, 80) + "..."
-              : selectedVideo.url;
-          videoUrlDiv.textContent = shortUrl;
-          videoUrlDiv.title = selectedVideo.url;
-
-          // Update button data attributes using the found video object
-          downloadBtn.dataset.url = selectedVideo.url;
-          // Preserve the display title (don't change it when selecting quality)
-          // The display title is already stored in data-display-title attribute
-          // Find index by URL (more reliable than object reference)
-          const videoIndex = videoData.urls.findIndex(
-            (v) => v.url === selectedVideo.url,
+          item.classList.toggle("expanded");
+          header.setAttribute(
+            "aria-expanded",
+            item.classList.contains("expanded"),
           );
-          downloadBtn.dataset.index =
-            videoIndex >= 0 ? videoIndex.toString() : "";
-          downloadBtn.dataset.qualityLabel = qualityLabel;
-          copyBtn.dataset.url = selectedVideo.url;
-
-          // Update selected state in menu
-          qualityMenu.querySelectorAll(".quality-menu-item").forEach((item) => {
-            item.classList.remove("selected");
-          });
-          menuItem.classList.add("selected");
-
-          // Close dropdown
-          qualityMenu.classList.remove("show");
-          item.classList.remove("dropdown-open");
         });
-      });
-
-      // Mark first quality as selected
-      if (qualityMenu.querySelectorAll(".quality-menu-item").length > 0) {
-        qualityMenu
-          .querySelectorAll(".quality-menu-item")[0]
-          .classList.add("selected");
+        header.addEventListener("keydown", (e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            header.click();
+          }
+        });
       }
     });
   };
 
-  // Show current page videos first (at the top)
-  if (currentPageVideos.length > 0) {
-    renderSectionHeader("Current Page", true);
-    renderVideos(currentPageVideos);
-  }
-
-  // Show all other pages videos in one section (only if there are other pages)
-  if (allOtherPagesVideos.length > 0) {
-    renderSectionHeader("Other Pages", false);
-    renderVideos(allOtherPagesVideos);
-  }
-
-  // Fallback: if no videos grouped by page, show all videos
-  if (Object.keys(videosByPage).length === 0 && reliableUrls.length > 0) {
+  if (reliableUrls.length > 0) {
     renderVideos(reliableUrls);
   }
 
-  // Add event listeners for all download buttons
-  document.querySelectorAll(".download-btn").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      const button = e.currentTarget;
-      const url = button.dataset.url;
-      const index = button.dataset.index;
-      // Find the video item from videoData.urls
+  // Event delegation: quality row Download and Copy (replaces old .download-btn / .copy-btn)
+  container.addEventListener("click", (e) => {
+    const downloadBtn = e.target.closest(".quality-download-btn");
+    if (downloadBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const url = downloadBtn.dataset.url;
+      const index = parseInt(downloadBtn.dataset.index, 10) || 0;
       const videoItem =
-        videoData.urls.find((v) => v.url === url) ||
-        (index !== undefined ? videoData.urls[index] : null);
-
+        videoData.urls.find((v) => v.url === url) || videoData.urls[index];
       if (videoItem) {
-        // Use the display title from the button (exactly what's shown in the list)
         const videoTitle =
-          button.dataset.displayTitle ||
+          downloadBtn.dataset.displayTitle ||
           cleanVideoTitle(videoItem.videoTitle) ||
           videoItem.videoTitle ||
-          cleanVideoTitle(videoData.videoTitle) ||
-          videoData.videoTitle ||
           "Video";
-        const qualityLabel = button.dataset.qualityLabel || "";
-        const convertToMp3 = button.dataset.convertMp3 === "true";
+        const qualityLabel = downloadBtn.dataset.qualityLabel || "";
+        const convertToMp3 = downloadBtn.dataset.convertMp3 === "1";
         const videoIndex = videoData.urls.findIndex((v) => v.url === url);
         downloadVideo(
           url,
@@ -1077,21 +796,22 @@ function displayVideos(videoData) {
           qualityLabel,
           convertToMp3,
         );
-      } else {
-        console.error("Video item not found for URL:", url);
       }
-    });
-  });
-
-  document.querySelectorAll(".copy-btn").forEach((btn) => {
-    btn.addEventListener("click", (e) => {
-      const url = e.target.dataset.url;
-      copyToClipboard(url);
-      e.target.textContent = "Copied!";
-      setTimeout(() => {
-        e.target.textContent = "Copy";
-      }, 2000);
-    });
+      return;
+    }
+    const copyBtn = e.target.closest(".quality-copy-btn");
+    if (copyBtn) {
+      e.preventDefault();
+      e.stopPropagation();
+      const url = copyBtn.dataset.url;
+      if (url) {
+        copyToClipboard(url);
+        copyBtn.textContent = "Copied!";
+        setTimeout(() => {
+          copyBtn.textContent = "Copy";
+        }, 2000);
+      }
+    }
   });
 
   // Add event listeners for parse buttons
@@ -1171,12 +891,15 @@ function extractQuality(type, url = "") {
 }
 
 function formatTypeLabel(type) {
-  if (type && (type === "hls-audio" || type.startsWith("hls-audio-"))) {
-    return "Audio";
+  if (!type) return "";
+  if (type === "hls-audio" || type.startsWith("hls-audio-")) {
+    const m = type.match(/hls-audio-(\d+)/i);
+    return m ? m[1] + "kbps" : "Audio";
   }
   if (type.includes("mp4")) {
     return type.toUpperCase();
-  } else if (type.includes("m3u8") || type.includes("hls")) {
+  }
+  if (type.includes("m3u8") || type.includes("hls")) {
     return "Stream";
   }
   return type.toUpperCase();

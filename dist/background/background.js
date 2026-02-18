@@ -1,12 +1,12 @@
-// Import utility functions (paths relative to this script's directory: background/)
-importScripts("../scripts/utils.js");
-importScripts("../scripts/storage.js");
-importScripts("../scripts/messaging.js");
-importScripts("cancelDownload.js");
-importScripts("startDownload.js");
-importScripts("downloadBlob.js");
-importScripts("downloadM3U8.js");
-importScripts("configParser.js");
+// Import utility functions (paths must be absolute from extension root for service worker)
+importScripts("/scripts/utils.js");
+importScripts("/scripts/storage.js");
+importScripts("/scripts/messaging.js");
+importScripts("/background/cancelDownload.js");
+importScripts("/background/startDownload.js");
+importScripts("/background/downloadBlob.js");
+importScripts("/background/downloadM3U8.js");
+importScripts("/background/configParser.js");
 
 // Store detected video URLs
 let videoData = {};
@@ -99,7 +99,8 @@ const CONTENT_SCRIPT_FILES = [
 const INJECT_BUTTON_RETRY_DELAYS_MS = [6000, 12000];
 
 function injectContentScriptIntoTab(tabId) {
-  if (!chrome.scripting || !chrome.scripting.executeScript) return Promise.resolve();
+  if (!chrome.scripting || !chrome.scripting.executeScript)
+    return Promise.resolve();
   return chrome.scripting
     .executeScript({
       target: { tabId },
@@ -110,16 +111,24 @@ function injectContentScriptIntoTab(tabId) {
       // Content script will try at ~4.5s; if DOM wasn't ready, request again at 6s and 12s
       INJECT_BUTTON_RETRY_DELAYS_MS.forEach((delayMs) => {
         setTimeout(() => {
-          chrome.tabs.sendMessage(tabId, { action: "requestInjectButton" }, () => {
-            if (chrome.runtime.lastError) {
-              // Tab closed or script not ready; ignore
-            }
-          });
+          chrome.tabs.sendMessage(
+            tabId,
+            { action: "requestInjectButton" },
+            () => {
+              if (chrome.runtime.lastError) {
+                // Tab closed or script not ready; ignore
+              }
+            },
+          );
         }, delayMs);
       });
     })
     .catch((err) => {
-      console.warn("[DM Downloader] Failed to inject content script into tab", tabId, err);
+      console.warn(
+        "[DM Downloader] Failed to inject content script into tab",
+        tabId,
+        err,
+      );
     });
 }
 
@@ -131,7 +140,10 @@ function ensureContentScriptInTab(tabId) {
   if (!tabId) return;
   chrome.tabs.sendMessage(tabId, { action: "ping" }, (response) => {
     const err = chrome.runtime.lastError?.message || "";
-    if (err.includes("Receiving end does not exist") || err.includes("Could not establish connection")) {
+    if (
+      err.includes("Receiving end does not exist") ||
+      err.includes("Could not establish connection")
+    ) {
       injectContentScriptIntoTab(tabId);
     }
   });
@@ -145,7 +157,11 @@ chrome.runtime.onInstalled.addListener((details) => {
       if (tab.id) injectContentScriptIntoTab(tab.id);
     });
     if (tabs.length > 0) {
-      console.log("[DM Downloader] Injected content scripts into", tabs.length, "existing Dailymotion tab(s)");
+      console.log(
+        "[DM Downloader] Injected content scripts into",
+        tabs.length,
+        "existing Dailymotion tab(s)",
+      );
     }
   });
 });
@@ -174,7 +190,11 @@ self.addEventListener("fetch", (event) => {
         blobId = u.searchParams.get("blobId");
         chunkCount = parseInt(u.searchParams.get("chunkCount"), 10);
         totalSize = parseInt(u.searchParams.get("totalSize"), 10);
-        if (!blobId || !Number.isFinite(chunkCount) || !Number.isFinite(totalSize)) {
+        if (
+          !blobId ||
+          !Number.isFinite(chunkCount) ||
+          !Number.isFinite(totalSize)
+        ) {
           return new Response("Invalid stream params", { status: 400 });
         }
       } catch (e) {
@@ -354,116 +374,62 @@ webRequestListener = (details) => {
       return; // Can't verify page, skip
     }
 
-    // Only process if we're on a video page
-    if (!isVideoPage(tab.url)) {
-      return; // Not a video page, skip URL detection
+    // Process if we're on a video page or feed (reels) page
+    if (
+      !isVideoPage(tab.url) &&
+      !(typeof isFeedPage === "function" && isFeedPage(tab.url))
+    ) {
+      return; // Not a video or feed page, skip URL detection
     }
 
-    // Detect m3u8 playlist files - only store master playlists, not individual segment playlists
-    if (url.includes(".m3u8")) {
-      // Check if it's a segment playlist (using utility function)
-      if (!isSegmentPlaylist(url)) {
-        console.log("M3U8 master playlist detected:", url);
-        // Get video title from tab title (always fetch fresh)
-        getVideoTitleFromTab(details.tabId).then(({ videoTitle, videoId }) => {
-          const finalVideoId = videoId || extractVideoId(url);
-
-          // Check if this is a different video than what's currently stored
-          if (videoData[details.tabId]) {
-            const currentActiveVideoId = videoData[details.tabId].activeUrl
-              ? videoData[details.tabId].urls.find(
-                  (u) => u.url === videoData[details.tabId].activeUrl,
-                )?.videoId
-              : null;
-
-            // If video changed, clear old title
-            if (
-              finalVideoId &&
-              currentActiveVideoId &&
-              finalVideoId !== currentActiveVideoId
-            ) {
-              console.log(
-                `New video detected (${currentActiveVideoId} -> ${finalVideoId}), clearing old title`,
-              );
-              videoData[details.tabId].videoTitle = null;
-            }
-          }
-
-          storeVideoUrl(
-            details.tabId,
-            url,
-            "hls-master",
-            true,
-            videoTitle,
-            finalVideoId,
-          ); // true = from network request (playing)
-          // Parse master playlist to extract all quality variants (don't await - fire and forget)
-          parseAndStoreHLSVariants(
-            details.tabId,
-            url,
-            finalVideoId,
-            videoTitle,
-            videoData,
-            storeVideoUrl,
-            parsingHLSVariants,
-          ).catch((err) => {
-            console.warn("Error parsing HLS variants:", err);
-          });
-        });
-      } else {
-        console.log("M3U8 segment playlist detected (skipping):", url);
-      }
-    }
-
-    // Detect mp4 files (skip range/chunked requests)
-    if (url.includes(".mp4")) {
-      if (isChunkedRangeUrl(url)) {
-        // Don't extract base URL from range URLs - they're unreliable and often incomplete
-        // Instead, rely on master.json parsing to get the full progressive MP4 URLs
-        // Skip storing range URLs or extracted base URLs
-        console.log(
-          "Range URL detected (skipping - will use master.json for full URLs):",
+    // When page requests HLS master playlist, parse it and store variants (same path as config, no master URL stored)
+    if (url.includes(".m3u8") && !isSegmentPlaylist(url)) {
+      console.log("M3U8 master playlist requested:", url);
+      getVideoTitleFromTab(details.tabId).then(({ videoTitle, videoId }) => {
+        const finalVideoId = videoId || extractVideoId(url);
+        parseAndStoreHLSVariants(
+          details.tabId,
           url,
-        );
-      } else {
-        console.log("MP4 detected:", url);
-        // Get video title from tab title (always fetch fresh)
-        getVideoTitleFromTab(details.tabId).then(({ videoTitle, videoId }) => {
-          const finalVideoId = videoId || extractVideoId(url);
-
-          // Check if this is a different video than what's currently stored
-          if (videoData[details.tabId]) {
-            const currentActiveVideoId = videoData[details.tabId].activeUrl
-              ? videoData[details.tabId].urls.find(
-                  (u) => u.url === videoData[details.tabId].activeUrl,
-                )?.videoId
-              : null;
-
-            // If video changed, clear old title
-            if (
-              finalVideoId &&
-              currentActiveVideoId &&
-              finalVideoId !== currentActiveVideoId
-            ) {
-              console.log(
-                `New video detected (${currentActiveVideoId} -> ${finalVideoId}), clearing old title`,
-              );
-              videoData[details.tabId].videoTitle = null;
-            }
-          }
-
-          storeVideoUrl(
-            details.tabId,
-            url,
-            "mp4",
-            true,
-            videoTitle,
-            finalVideoId,
-          ); // true = from network request (playing)
+          finalVideoId,
+          videoTitle,
+          videoData,
+          storeVideoUrl,
+          parsingHLSVariants,
+          getVideoTitleFromDailymotionApi,
+        ).catch((err) => {
+          console.warn("Error parsing HLS variants from network:", err);
         });
+      });
+    }
+
+    // Feed: detect video JSON API (e.g. geo.dailymotion.com/video/xa06sri.json) and tell content to inject button for that video ID
+    if (
+      (url.includes("geo.dailymotion.com") ||
+        url.includes("dailymotion.com")) &&
+      url.includes("/video/") &&
+      url.includes(".json")
+    ) {
+      const feedMatch = url.match(/\/video\/([a-zA-Z0-9]+)\.json/);
+
+      console.log("[DM Downloader] Feed: feedMatch", feedMatch);
+      if (
+        feedMatch &&
+        typeof isFeedPage === "function" &&
+        isFeedPage(tab.url)
+      ) {
+        const videoId = feedMatch[1];
+
+        console.log(
+          "[DM Downloader] Feed: sending message to content script",
+          videoId,
+        );
+        chrome.tabs
+          .sendMessage(details.tabId, { action: "feedVideoFromApi", videoId })
+          .catch(() => {});
       }
     }
 
+    // Config path: master.json → extract HLS master URL(s) → parseAndStoreHLSVariants stores each variant
     // Detect config files (Dailymotion metadata) - fetch and parse it (deduped)
     // Dailymotion may use different config file patterns (config.json, player.json, etc.)
     if (
@@ -481,10 +447,9 @@ webRequestListener = (details) => {
           norm,
           videoData,
           storeVideoUrl,
-          parseAndStoreHLSVariants,
           getVideoTitleFromTab,
           processedConfigs,
-          parsingHLSVariants,
+          getVideoTitleFromDailymotionApi,
         );
       }
     }
@@ -676,7 +641,7 @@ chrome.webRequest.onHeadersReceived.addListener(
   ["responseHeaders"],
 );
 
-// Get video title from tab title (uses utils.cleanVideoTitle)
+// Get video title: prefer Dailymotion oEmbed API by video ID, fallback to tab title (cleanVideoTitle)
 function getVideoTitleFromTab(tabId) {
   return new Promise((resolve) => {
     if (!tabId || tabId < 0) {
@@ -685,20 +650,66 @@ function getVideoTitleFromTab(tabId) {
     }
 
     chrome.tabs.get(tabId, (tab) => {
-      if (chrome.runtime.lastError || !tab || !tab.title) {
+      if (chrome.runtime.lastError || !tab || !tab.url) {
         resolve({ videoTitle: null, videoId: null });
         return;
       }
 
-      // Use utility function to clean title
-      const title = cleanVideoTitle(tab.title);
+      const videoId = extractVideoId(tab.url);
+      const fallbackTitle = tab.title ? cleanVideoTitle(tab.title) : null;
 
-      // Extract video ID from tab URL using utility function
-      const videoId = tab.url ? extractVideoId(tab.url) : null;
-
-      resolve({ videoTitle: title, videoId: videoId });
+      // Prefer title from Dailymotion API when we have a video ID
+      if (videoId) {
+        getVideoTitleFromDailymotionApi(videoId)
+          .then((apiTitle) => {
+            resolve({
+              videoTitle: apiTitle || fallbackTitle,
+              videoId,
+            });
+          })
+          .catch(() => {
+            resolve({ videoTitle: fallbackTitle, videoId });
+          });
+      } else {
+        resolve({ videoTitle: fallbackTitle, videoId });
+      }
     });
   });
+}
+
+/** Fetch video title from Dailymotion oEmbed API by video ID (no page title needed). */
+async function getVideoTitleFromDailymotionApi(videoId) {
+  if (!videoId || typeof videoId !== "string") return null;
+  try {
+    const url = `https://www.dailymotion.com/services/oembed?url=https://www.dailymotion.com/video/${encodeURIComponent(videoId)}`;
+    const r = await fetch(url);
+    if (!r.ok) return null;
+    const j = await r.json();
+    const title = j && typeof j.title === "string" ? j.title.trim() : null;
+    if (title)
+      console.log("[title] from Dailymotion API for", videoId, ":", title);
+    return title || null;
+  } catch (e) {
+    console.warn("getVideoTitleFromDailymotionApi failed:", e?.message || e);
+    return null;
+  }
+}
+
+/** Returns the videoId of the currently active URL for this tab, or null. */
+function getActiveVideoId(tabId) {
+  const data = videoData[tabId];
+  if (!data || !data.activeUrl || !Array.isArray(data.urls)) return null;
+  return data.urls.find((u) => u.url === data.activeUrl)?.videoId ?? null;
+}
+
+/** True if url entry is a real video (HLS variant, etc.), not config or legacy type. */
+function isVideoUrlForTab(item) {
+  return (
+    item.type !== "config" &&
+    !item.url.includes("master.json") &&
+    !item.url.includes("config") &&
+    !item.type.includes("mp4-full")
+  );
 }
 
 function storeVideoUrl(
@@ -747,11 +758,7 @@ function storeVideoUrl(
     videoId = extractVideoId(url);
   }
 
-  // Check if this is a new video (different videoId than what we have stored)
-  const currentVideoId = videoData[tabId].activeUrl
-    ? videoData[tabId].urls.find((u) => u.url === videoData[tabId].activeUrl)
-        ?.videoId
-    : null;
+  const currentVideoId = getActiveVideoId(tabId);
 
   // If we have a new videoId that's different from the current one, clear the old tab-level title
   if (videoId && currentVideoId && videoId !== currentVideoId) {
@@ -765,12 +772,7 @@ function storeVideoUrl(
   // CRITICAL: Only update title if it doesn't exist yet, or if this URL is for the CURRENT active video
   // This prevents old videos from getting overwritten with the current page's title
   if (videoTitle && videoId) {
-    // Check if this videoId is the currently active video
-    const activeVideoId = videoData[tabId].activeUrl
-      ? videoData[tabId].urls.find((u) => u.url === videoData[tabId].activeUrl)
-          ?.videoId
-      : null;
-    const isActiveVideo = activeVideoId === videoId;
+    const isActiveVideo = getActiveVideoId(tabId) === videoId;
 
     if (!videoData[tabId].videoIds[videoId]) {
       // No title exists for this videoId - create it
@@ -790,12 +792,7 @@ function storeVideoUrl(
   // Don't update tab-level title if we're storing a URL for a different video
   // This prevents old videos from getting the new video's title
   if (videoTitle && videoId) {
-    // Only update tab-level title if this is the active video or if tab-level title is null/empty
-    const activeVideoId = videoData[tabId].activeUrl
-      ? videoData[tabId].urls.find((u) => u.url === videoData[tabId].activeUrl)
-          ?.videoId
-      : null;
-
+    const activeVideoId = getActiveVideoId(tabId);
     if (
       !activeVideoId ||
       activeVideoId === videoId ||
@@ -816,54 +813,13 @@ function storeVideoUrl(
   // Avoid duplicates - check exact URL match
   const existingUrl = videoData[tabId].urls.find((item) => item.url === url);
   if (!existingUrl) {
-    // If we already have an mp4-full, skip storing more mp4-full URLs (keep the first)
-    if (type.includes("mp4-full")) {
-      const hasFull = videoData[tabId].urls.some((item) =>
-        item.type.includes("mp4-full"),
+    // When storing HLS variant, drop any stale hls-master entries for same video (we only store variants)
+    if (videoId && type.startsWith("hls-") && type !== "hls-master") {
+      videoData[tabId].urls = videoData[tabId].urls.filter(
+        (item) =>
+          !(item.type === "hls-master" && item.videoId === videoId) ||
+          item.url === url,
       );
-      if (hasFull) return;
-    }
-    // Only remove HLS master playlists when storing variants, not the variants themselves
-    // Don't remove HLS URLs from different videos
-    if (type.includes("hls") || type.includes("m3u8")) {
-      // If storing a variant (hls-240p, hls-360p, etc.), only remove master playlists with same videoId
-      // If storing a master playlist, don't remove variants
-      if (videoId && type.startsWith("hls-") && type !== "hls-master") {
-        // Storing a variant - only remove master playlists, keep all other variants
-        videoData[tabId].urls = videoData[tabId].urls.filter(
-          (item) =>
-            !(item.type === "hls-master" && item.videoId === videoId) ||
-            item.url === url,
-        );
-      } else if (
-        videoId &&
-        (type === "hls-master" || type.includes("hls-master"))
-      ) {
-        // Storing a master playlist - only remove other master playlists with same videoId, keep variants
-        videoData[tabId].urls = videoData[tabId].urls.filter(
-          (item) =>
-            !(item.type === "hls-master" && item.videoId === videoId) ||
-            item.url === url ||
-            (item.type &&
-              item.type.startsWith("hls-") &&
-              item.type !== "hls-master"), // Keep all variants
-        );
-      } else if (videoId) {
-        // Other HLS types - only remove if different video
-        videoData[tabId].urls = videoData[tabId].urls.filter(
-          (item) =>
-            !(
-              item.type &&
-              item.type.includes("hls") &&
-              item.videoId === videoId &&
-              item.type !== type
-            ) ||
-            item.url === url ||
-            (item.videoId && item.videoId !== videoId), // Keep HLS URLs from different videos
-        );
-      }
-      // If no videoId, only remove exact URL matches (don't remove other HLS URLs)
-      // This allows multiple videos without videoId to coexist
     }
 
     // Get title for this specific video ID - only use videoId-specific title or provided title, NOT tab-level title
@@ -943,14 +899,7 @@ function storeVideoUrl(
       }
     }
 
-    // Update title ONLY if:
-    // 1. No title exists yet, OR
-    // 2. This URL belongs to the currently active video (title might have changed), OR
-    // 3. The provided title is from a reliable source (network request) and matches the videoId
-    const activeVideoId = videoData[tabId].activeUrl
-      ? videoData[tabId].urls.find((u) => u.url === videoData[tabId].activeUrl)
-          ?.videoId
-      : null;
+    const activeVideoId = getActiveVideoId(tabId);
     const isActiveVideo = activeVideoId === videoId;
     const hasExistingTitle =
       existingUrl.videoTitle &&
@@ -986,189 +935,176 @@ function storeVideoUrl(
 }
 
 // Update which video is marked as active (currently playing)
-// The active video is the most recently requested video from a network request
-// If multiple videos have the same video ID, prefer the one from network request
-// Optionally, you can pass a specific videoId to mark as active (e.g., from current page URL)
+// On feed pages we skip pruning so multiple reels keep their URLs for per-reel download buttons
 function updateActiveVideo(tabId, currentVideoId = null) {
   if (!videoData[tabId] || !videoData[tabId].urls.length) return;
 
-  // Filter out config files - they should never be marked as active
-  const videoUrls = videoData[tabId].urls.filter(
-    (v) =>
-      v.type !== "config" &&
-      !v.url.includes("master.json") &&
-      !v.url.includes("config") &&
-      !v.type.includes("mp4-full"), // Also exclude mp4-full
-  );
+  chrome.tabs.get(tabId, (tab) => {
+    const skipPrune =
+      tab && typeof isFeedPage === "function" && isFeedPage(tab.url);
 
-  if (videoUrls.length === 0) return; // No valid videos to mark as active
+    const videoUrls = videoData[tabId].urls.filter(isVideoUrlForTab);
+    if (videoUrls.length === 0) return;
 
-  // Get the previous active videoId before clearing
-  const previousActiveVideoId = videoData[tabId].activeUrl
-    ? videoData[tabId].urls.find((u) => u.url === videoData[tabId].activeUrl)
-        ?.videoId
-    : null;
+    const previousActiveVideoId = getActiveVideoId(tabId);
+    videoData[tabId].urls.forEach((item) => (item.active = false));
 
-  // Clear all active flags first
-  videoData[tabId].urls.forEach((item) => (item.active = false));
-
-  // If we have a currentVideoId (from page URL), prioritize videos matching that ID
-  if (currentVideoId) {
-    const matchingVideos = videoUrls.filter(
-      (v) => v.videoId === currentVideoId,
-    );
-    if (matchingVideos.length > 0) {
-      // Mark all videos with matching videoId as active
-      matchingVideos.forEach((v) => (v.active = true));
-      // Set the most recent one as the active URL
-      const mostRecent = matchingVideos.reduce((latest, current) =>
-        (current.timestamp || 0) > (latest.timestamp || 0) ? current : latest,
+    if (currentVideoId) {
+      const matchingVideos = videoUrls.filter(
+        (v) => v.videoId === currentVideoId,
       );
-      videoData[tabId].activeUrl = mostRecent.url;
-
-      // If video changed, clear old tab-level title and update with new one
-      if (previousActiveVideoId && previousActiveVideoId !== currentVideoId) {
-        console.log(
-          `Video changed from ${previousActiveVideoId} to ${currentVideoId}, clearing old title`,
+      if (matchingVideos.length > 0) {
+        // Mark all videos with matching videoId as active
+        matchingVideos.forEach((v) => (v.active = true));
+        // Set the most recent one as the active URL
+        const mostRecent = matchingVideos.reduce((latest, current) =>
+          (current.timestamp || 0) > (latest.timestamp || 0) ? current : latest,
         );
-        videoData[tabId].videoTitle = null;
-        // Try to get fresh title from tab
-        getVideoTitleFromTab(tabId).then(({ videoTitle }) => {
-          if (videoTitle) {
-            videoData[tabId].videoTitle = videoTitle;
-            // Update videoId-specific title mapping
-            if (currentVideoId) {
-              if (!videoData[tabId].videoIds[currentVideoId]) {
-                videoData[tabId].videoIds[currentVideoId] = {
-                  title: videoTitle,
-                };
-              } else {
-                videoData[tabId].videoIds[currentVideoId].title = videoTitle;
-              }
-            }
-            // Update only URLs for this specific videoId with the new title
-            // But only if they don't already have a valid title (preserve existing titles)
-            videoData[tabId].urls.forEach((url) => {
-              if (url.videoId === currentVideoId) {
-                const hasValidTitle =
-                  url.videoTitle &&
-                  url.videoTitle !== "Dailymotion Video" &&
-                  !url.videoTitle
-                    .toLowerCase()
-                    .includes("dailymotion video player");
-                // Only update if no valid title exists (preserve existing titles)
-                if (!hasValidTitle) {
-                  url.videoTitle = videoTitle;
+        videoData[tabId].activeUrl = mostRecent.url;
+
+        // If video changed, clear old tab-level title and update with new one
+        if (previousActiveVideoId && previousActiveVideoId !== currentVideoId) {
+          console.log(
+            `Video changed from ${previousActiveVideoId} to ${currentVideoId}, clearing old title`,
+          );
+          videoData[tabId].videoTitle = null;
+          // Try to get fresh title from tab
+          getVideoTitleFromTab(tabId).then(({ videoTitle }) => {
+            if (videoTitle) {
+              videoData[tabId].videoTitle = videoTitle;
+              // Update videoId-specific title mapping
+              if (currentVideoId) {
+                if (!videoData[tabId].videoIds[currentVideoId]) {
+                  videoData[tabId].videoIds[currentVideoId] = {
+                    title: videoTitle,
+                  };
+                } else {
+                  videoData[tabId].videoIds[currentVideoId].title = videoTitle;
                 }
               }
-            });
-          }
-        });
-      }
+              // Update only URLs for this specific videoId with the new title
+              // But only if they don't already have a valid title (preserve existing titles)
+              videoData[tabId].urls.forEach((url) => {
+                if (url.videoId === currentVideoId) {
+                  const hasValidTitle =
+                    url.videoTitle &&
+                    url.videoTitle !== "Dailymotion Video" &&
+                    !url.videoTitle
+                      .toLowerCase()
+                      .includes("dailymotion video player");
+                  // Only update if no valid title exists (preserve existing titles)
+                  if (!hasValidTitle) {
+                    url.videoTitle = videoTitle;
+                  }
+                }
+              });
+            }
+          });
+        }
 
-      // Only keep records for the current video — remove other videos' URLs and titles
-      const activeVideoIdForPrune = currentVideoId;
+        if (!skipPrune) {
+          const activeVideoIdForPrune = currentVideoId;
+          videoData[tabId].urls = videoData[tabId].urls.filter(
+            (u) => u.videoId === activeVideoIdForPrune,
+          );
+          if (videoData[tabId].videoIds && activeVideoIdForPrune) {
+            const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
+            videoData[tabId].videoIds = keepTitle
+              ? { [activeVideoIdForPrune]: keepTitle }
+              : {};
+          }
+        }
+
+        console.log("Active video updated (by videoId):", {
+          videoId: currentVideoId,
+          url: mostRecent.url,
+          type: mostRecent.type,
+          count: matchingVideos.length,
+        });
+        return;
+      }
+    }
+
+    // Find the most recent video that came from a network request (not from config parsing)
+    const networkRequestVideos = videoUrls.filter((v) => v.fromNetworkRequest);
+
+    if (networkRequestVideos.length === 0) {
+      // If no network request videos, use the most recent video overall (but not config)
+      const mostRecent = videoUrls.reduce((latest, current) =>
+        (current.timestamp || 0) > (latest.timestamp || 0) ? current : latest,
+      );
+      if (mostRecent) {
+        mostRecent.active = true;
+        videoData[tabId].activeUrl = mostRecent.url;
+        if (!skipPrune && mostRecent.videoId) {
+          const activeVideoIdForPrune = mostRecent.videoId;
+          videoData[tabId].urls = videoData[tabId].urls.filter(
+            (u) => u.videoId === activeVideoIdForPrune,
+          );
+          if (videoData[tabId].videoIds) {
+            const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
+            videoData[tabId].videoIds = keepTitle
+              ? { [activeVideoIdForPrune]: keepTitle }
+              : {};
+          }
+        }
+      }
+      return;
+    }
+
+    // Group network request videos by video ID
+    // If multiple videos share the same video ID, they're likely the same video (different qualities)
+    // In this case, prefer the one with the most recent timestamp
+    const videosByVideoId = {};
+    networkRequestVideos.forEach((v) => {
+      const key = v.videoId || "unknown";
+      if (
+        !videosByVideoId[key] ||
+        (v.timestamp || 0) > (videosByVideoId[key].timestamp || 0)
+      ) {
+        videosByVideoId[key] = v;
+      }
+    });
+
+    // Find the most recent video (across all video IDs)
+    const mostRecentNetwork = Object.values(videosByVideoId).reduce(
+      (latest, current) =>
+        (current.timestamp || 0) > (latest.timestamp || 0) ? current : latest,
+    );
+
+    // Mark the most recent network request video as active
+    mostRecentNetwork.active = true;
+    videoData[tabId].activeUrl = mostRecentNetwork.url;
+
+    // Also mark all videos with the same video ID as active (they're the same video, different qualities)
+    if (mostRecentNetwork.videoId) {
+      videoUrls.forEach((v) => {
+        if (v.videoId === mostRecentNetwork.videoId) {
+          v.active = true;
+        }
+      });
+    }
+
+    if (!skipPrune && mostRecentNetwork.videoId) {
+      const activeVideoIdForPrune = mostRecentNetwork.videoId;
       videoData[tabId].urls = videoData[tabId].urls.filter(
         (u) => u.videoId === activeVideoIdForPrune,
       );
-      if (videoData[tabId].videoIds && activeVideoIdForPrune) {
+      if (videoData[tabId].videoIds) {
         const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
         videoData[tabId].videoIds = keepTitle
           ? { [activeVideoIdForPrune]: keepTitle }
           : {};
       }
-
-      console.log("Active video updated (by videoId):", {
-        videoId: currentVideoId,
-        url: mostRecent.url,
-        type: mostRecent.type,
-        count: matchingVideos.length,
-      });
-      return;
     }
-  }
 
-  // Find the most recent video that came from a network request (not from config parsing)
-  const networkRequestVideos = videoUrls.filter((v) => v.fromNetworkRequest);
-
-  if (networkRequestVideos.length === 0) {
-    // If no network request videos, use the most recent video overall (but not config)
-    const mostRecent = videoUrls.reduce((latest, current) =>
-      (current.timestamp || 0) > (latest.timestamp || 0) ? current : latest,
-    );
-    if (mostRecent) {
-      mostRecent.active = true;
-      videoData[tabId].activeUrl = mostRecent.url;
-      // Only keep records for this current video
-      const activeVideoIdForPrune = mostRecent.videoId;
-      if (activeVideoIdForPrune) {
-        videoData[tabId].urls = videoData[tabId].urls.filter(
-          (u) => u.videoId === activeVideoIdForPrune,
-        );
-        if (videoData[tabId].videoIds) {
-          const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
-          videoData[tabId].videoIds = keepTitle
-            ? { [activeVideoIdForPrune]: keepTitle }
-            : {};
-        }
-      }
-    }
-    return;
-  }
-
-  // Group network request videos by video ID
-  // If multiple videos share the same video ID, they're likely the same video (different qualities)
-  // In this case, prefer the one with the most recent timestamp
-  const videosByVideoId = {};
-  networkRequestVideos.forEach((v) => {
-    const key = v.videoId || "unknown";
-    if (
-      !videosByVideoId[key] ||
-      (v.timestamp || 0) > (videosByVideoId[key].timestamp || 0)
-    ) {
-      videosByVideoId[key] = v;
-    }
-  });
-
-  // Find the most recent video (across all video IDs)
-  const mostRecentNetwork = Object.values(videosByVideoId).reduce(
-    (latest, current) =>
-      (current.timestamp || 0) > (latest.timestamp || 0) ? current : latest,
-  );
-
-  // Mark the most recent network request video as active
-  mostRecentNetwork.active = true;
-  videoData[tabId].activeUrl = mostRecentNetwork.url;
-
-  // Also mark all videos with the same video ID as active (they're the same video, different qualities)
-  if (mostRecentNetwork.videoId) {
-    videoUrls.forEach((v) => {
-      if (v.videoId === mostRecentNetwork.videoId) {
-        v.active = true;
-      }
+    console.log("Active video updated:", {
+      url: mostRecentNetwork.url,
+      type: mostRecentNetwork.type,
+      videoId: mostRecentNetwork.videoId,
+      videoTitle: mostRecentNetwork.videoTitle,
+      timestamp: mostRecentNetwork.timestamp,
     });
-  }
-
-  // Only keep records for the current video — remove other videos' URLs and titles
-  const activeVideoIdForPrune = mostRecentNetwork.videoId;
-  if (activeVideoIdForPrune) {
-    videoData[tabId].urls = videoData[tabId].urls.filter(
-      (u) => u.videoId === activeVideoIdForPrune,
-    );
-    if (videoData[tabId].videoIds) {
-      const keepTitle = videoData[tabId].videoIds[activeVideoIdForPrune];
-      videoData[tabId].videoIds = keepTitle
-        ? { [activeVideoIdForPrune]: keepTitle }
-        : {};
-    }
-  }
-
-  console.log("Active video updated:", {
-    url: mostRecentNetwork.url,
-    type: mostRecentNetwork.type,
-    videoId: mostRecentNetwork.videoId,
-    videoTitle: mostRecentNetwork.videoTitle,
-    timestamp: mostRecentNetwork.timestamp,
   });
 }
 
@@ -1187,17 +1123,24 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
   // Handle offscreen document ready signal
   if (request.action === "offscreenReady") {
-    console.log("Offscreen document sent ready signal. FFmpeg (ffmpeg.wasm) available:", request.ffmpegAvailable === true);
+    console.log(
+      "Offscreen document sent ready signal. FFmpegHelper available:",
+      request.ffmpegAvailable === true,
+    );
     sendResponse({ received: true });
     return true;
   }
 
   if (request.action === "convertProgress" && request.downloadId != null) {
     const p = request.progress;
-    chrome.storage.local.set({
-      [`downloadStatus_${request.downloadId}`]:
-        typeof p === "number" ? `Converting to MP4... ${Math.round(p * 100)}%` : "Converting to MP4...",
-    }).catch(() => {});
+    chrome.storage.local
+      .set({
+        [`downloadStatus_${request.downloadId}`]:
+          typeof p === "number"
+            ? `Converting to MP4... ${Math.round(p * 100)}%`
+            : "Converting to MP4...",
+      })
+      .catch(() => {});
     return false;
   }
 
@@ -1209,35 +1152,78 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     }
 
     const raw = videoData[tabId] || { urls: [] };
-
-    // Only send the current video to the popup — filter by active video
-    const activeVideoId = raw.activeUrl
-      ? raw.urls.find((u) => u.url === raw.activeUrl)?.videoId
-      : null;
-    const urls = activeVideoId
-      ? raw.urls.filter((v) => v.videoId === activeVideoId)
+    // Feed page can request data for a specific videoId (reel); otherwise use active video
+    const requestedVideoId = request.videoId || null;
+    const activeVideoId = getActiveVideoId(tabId);
+    const filterVideoId = requestedVideoId || activeVideoId;
+    let urls = filterVideoId
+      ? raw.urls.filter((v) => v.videoId === filterVideoId)
       : raw.urls;
-    const videoIds = raw.videoIds || {};
-    const data = {
-      urls,
-      activeUrl: raw.activeUrl,
-      videoTitle: raw.videoTitle,
-      videoIds: activeVideoId && videoIds[activeVideoId]
-        ? { [activeVideoId]: videoIds[activeVideoId] }
-        : videoIds,
-    };
 
-    // Update badge when popup requests data (in case it wasn't updated during navigation)
-    if (tabId) {
-      updateBadge(tabId);
-    }
+    (async () => {
+      // Parse one HLS quality to get segment count; if > 1500, show only max 720p
+      const SEGMENT_LIMIT = 1500;
+      const MAX_QUALITY_WHEN_HIGH_SEGMENTS = 720;
+      const firstHls = urls.find(
+        (v) =>
+          v &&
+          v.url &&
+          (v.type?.includes("hls") ||
+            v.type?.includes("m3u8") ||
+            v.url.includes("m3u8")),
+      );
+      if (firstHls?.url && typeof getSegmentCountForM3u8Url === "function") {
+        try {
+          const { segmentCount } = await getSegmentCountForM3u8Url(
+            firstHls.url,
+            tabId,
+          );
+          if (
+            segmentCount > SEGMENT_LIMIT &&
+            typeof extractQuality === "function"
+          ) {
+            urls = urls.filter((v) => {
+              const q = extractQuality(v.type, v.url);
+              return q == null || q <= MAX_QUALITY_WHEN_HIGH_SEGMENTS;
+            });
+          }
+        } catch (_) {
+          // ignore
+        }
+      }
 
-    console.log("Sending video data for tabId:", tabId, "(current video only, URLs:", data.urls.length, ")");
-    sendResponse({ videoData: data });
-    // If popup is showing a video but the page never got the content script (e.g. tab was open before install), inject now
-    if (tabId && data.urls.length > 0) {
-      ensureContentScriptInTab(tabId);
-    }
+      const videoIds = raw.videoIds || {};
+      const titleVideoId = filterVideoId || activeVideoId;
+      const data = {
+        urls,
+        activeUrl: raw.activeUrl,
+        videoTitle:
+          titleVideoId && videoIds[titleVideoId]?.title
+            ? videoIds[titleVideoId].title
+            : raw.videoTitle,
+        videoIds:
+          titleVideoId && videoIds[titleVideoId]
+            ? { [titleVideoId]: videoIds[titleVideoId] }
+            : videoIds,
+      };
+
+      if (tabId) {
+        updateBadge(tabId);
+      }
+
+      console.log(
+        "Sending video data for tabId:",
+        tabId,
+        "(current video only, URLs:",
+        data.urls.length,
+        ")",
+      );
+      sendResponse({ videoData: data });
+      if (tabId && data.urls.length > 0) {
+        ensureContentScriptInTab(tabId);
+      }
+    })();
+    return true;
   } else if (request.action === "getDownloadInfo") {
     // Return download info for a specific download ID
     // First check in-memory Map, then try storage (for persistence across service worker restarts)
@@ -1282,45 +1268,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       blobToDataUrl,
     );
   } else if (request.action === "storeFromContent") {
-    // Store URLs sent from content script
-    // Content script should always send title, but if it doesn't, get it from tab title
-    let videoTitle = request.videoTitle;
-    let videoId = request.videoId;
-
-    // If no title provided or it's generic, get it from tab title
-    if (
-      !videoTitle ||
-      videoTitle === "Dailymotion Video" ||
-      videoTitle.toLowerCase().includes("dailymotion video player")
-    ) {
-      getVideoTitleFromTab(sender.tab.id).then(
-        ({ videoTitle: fetchedTitle, videoId: fetchedId }) => {
-          if (fetchedTitle) {
-            videoTitle = fetchedTitle;
-          }
-          if (fetchedId) {
-            videoId = fetchedId;
-          }
-          storeVideoUrl(
-            sender.tab.id,
-            request.url,
-            request.type,
-            false,
-            videoTitle,
-            videoId,
-          );
-        },
-      );
-    } else {
-      storeVideoUrl(
-        sender.tab.id,
-        request.url,
-        request.type,
-        false,
-        videoTitle,
-        videoId,
-      );
-    }
+    // URLs only come from config → parseAndStoreHLSVariants; no storage from content script.
     sendResponse({ success: true });
   } else if (request.action === "parseConfig") {
     // Manually parse a config file
@@ -1330,10 +1278,9 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       normalizeConfigUrl(request.url),
       videoData,
       storeVideoUrl,
-      parseAndStoreHLSVariants,
       getVideoTitleFromTab,
       processedConfigs,
-      parsingHLSVariants,
+      getVideoTitleFromDailymotionApi,
     )
       .then(() => {
         sendResponse({ success: true });
@@ -1408,7 +1355,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 // Blob download functions (downloadFullVideoFile, downloadVideo, setupOffscreenDocument,
 // blobToDataUrl, cleanupIndexedDBBlob, supportsObjectUrl) are now in downloadBlob.js
 // HLS/M3U8 functions (getFetchOptionsWithHeaders, parseM3U8, parseMasterPlaylist,
-// downloadAndMergeM3U8, parseAndStoreHLSVariants, findDailymotionTabId) are now in downloadM3U8.js
+// downloadAndMergeM3U8, findDailymotionTabId in downloadM3U8.js; parseAndStoreHLSVariants in configParser.js
 // Config parsing functions (fetchAndParseMasterJson, shouldSkipConfig) are now in configParser.js
 // URL utilities (isChunkedRangeUrl, extractBaseUrlFromRange) are now in scripts/utils.js
 
@@ -1438,10 +1385,22 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   delete videoData[tabId];
 });
 
-// Update badge when tab is updated (navigation, back/forward, etc.)
+// Update badge when tab is updated (navigation, back/forward, refresh)
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   // Only process Dailymotion tabs
   if (!tab.url || !tab.url.includes("dailymotion.com")) {
+    return;
+  }
+
+  // When navigation starts (including refresh), clear stored URLs for this tab
+  // so we don't accumulate duplicates when the same page is refreshed
+  if (changeInfo.status === "loading") {
+    if (isVideoPage(tab.url) && videoData[tabId]) {
+      videoData[tabId].urls = [];
+      videoData[tabId].activeUrl = null;
+      videoData[tabId].videoTitle = null;
+      videoData[tabId].videoIds = {};
+    }
     return;
   }
 
@@ -1466,13 +1425,7 @@ function updateBadge(tabId) {
   if (!videoData[tabId]) return;
 
   try {
-    const videoCount = videoData[tabId].urls.filter(
-      (v) =>
-        v.type !== "config" &&
-        !v.url.includes("master.json") &&
-        !v.url.includes("config") &&
-        !v.type.includes("mp4-full"),
-    ).length;
+    const videoCount = videoData[tabId].urls.filter(isVideoUrlForTab).length;
 
     chrome.action.setBadgeText({
       text: videoCount > 0 ? videoCount.toString() : "",

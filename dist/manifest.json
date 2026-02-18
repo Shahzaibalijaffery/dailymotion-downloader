@@ -4,7 +4,7 @@
   "version": "1.0.0",
   "description": "Download Dailymotion videos in m3u8, mp4 and other formats",
   "content_security_policy": {
-    "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"
+    "extension_pages": "script-src 'self'; object-src 'self'"
   },
   "permissions": [
     "activeTab",
@@ -56,5 +56,11 @@
     "16": "icons/icon16.png",
     "48": "icons/icon48.png",
     "128": "icons/icon128.png"
-  }
+  },
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/feed-download-icon.png"],
+      "matches": ["*://*.dailymotion.com/*"]
+    }
+  ]
 }
