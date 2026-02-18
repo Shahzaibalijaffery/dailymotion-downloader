@@ -13,7 +13,8 @@
     "storage",
     "offscreen",
     "cookies",
-    "scripting"
+    "scripting",
+    "tabs"
   ],
   "host_permissions": [
     "*://*.dailymotion.com/*",

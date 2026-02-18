@@ -1,12 +1,16 @@
-// Import utility functions (paths must be absolute from extension root for service worker)
-importScripts("/scripts/utils.js");
-importScripts("/scripts/storage.js");
-importScripts("/scripts/messaging.js");
-importScripts("/background/cancelDownload.js");
-importScripts("/background/startDownload.js");
-importScripts("/background/downloadBlob.js");
-importScripts("/background/downloadM3U8.js");
-importScripts("/background/configParser.js");
+// In Chrome (service worker) we use importScripts. In Firefox (background.scripts) the manifest loads these first.
+if (typeof importScripts !== "undefined") {
+  importScripts(
+    "/scripts/utils.js",
+    "/scripts/storage.js",
+    "/scripts/messaging.js",
+    "/background/cancelDownload.js",
+    "/background/startDownload.js",
+    "/background/downloadBlob.js",
+    "/background/downloadM3U8.js",
+    "/background/configParser.js",
+  );
+}
 
 // Store detected video URLs
 let videoData = {};

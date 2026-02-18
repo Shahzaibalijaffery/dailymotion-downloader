@@ -11,9 +11,9 @@
     "downloads",
     "webRequest",
     "storage",
-    "offscreen",
     "cookies",
-    "scripting"
+    "scripting",
+    "tabs"
   ],
   "host_permissions": [
     "*://*.dailymotion.com/*",
@@ -23,7 +23,17 @@
     "https://helper.addoncrop.com/*"
   ],
   "background": {
-    "service_worker": "background/background.js"
+    "scripts": [
+      "scripts/utils.js",
+      "scripts/storage.js",
+      "scripts/messaging.js",
+      "background/cancelDownload.js",
+      "background/startDownload.js",
+      "background/downloadBlob.js",
+      "background/downloadM3U8.js",
+      "background/configParser.js",
+      "background/background.js"
+    ]
   },
   "content_scripts": [
     {
@@ -62,5 +72,11 @@
       "resources": ["assets/feed-download-icon.png"],
       "matches": ["*://*.dailymotion.com/*"]
     }
-  ]
+  ],
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "dailymotion-downloader@dailymotion-downloader.local",
+      "strict_min_version": "109.0"
+    }
+  }
 }

@@ -1250,84 +1250,152 @@ async function blobToDataUrl(blob) {
   return `data:${blob.type || "application/octet-stream"};base64,${base64}`;
 }
 
+/** Firefox only: hidden iframe hosting offscreen page (reused). Chrome uses offscreen API. */
+let firefoxOffscreenIframe = null;
+
 /**
- * Create or get offscreen document
- * Offscreen document is needed for IndexedDB access and URL.createObjectURL
+ * Ping the offscreen document (Chrome offscreen or Firefox hidden iframe) to confirm it's ready.
+ * @returns {Promise<boolean>}
+ */
+function pingOffscreenDocument() {
+  return new Promise((resolve) => {
+    const timeout = setTimeout(() => resolve(false), 2000);
+    chrome.runtime.sendMessage({ action: "ping" }, (response) => {
+      clearTimeout(timeout);
+      resolve(
+        !chrome.runtime.lastError &&
+          (response?.ready === true || response?.success === true),
+      );
+    });
+  });
+}
+
+/**
+ * Create or get offscreen document.
+ * Chrome: uses chrome.offscreen API.
+ * Firefox: uses a hidden iframe in the background page (no offscreen API support).
  * @returns {Promise<void>}
  */
 async function setupOffscreenDocument() {
-  try {
-    const offscreenPath = "background/offscreen.html";
-    const offscreenUrl = chrome.runtime.getURL(offscreenPath);
+  const offscreenPath = "background/offscreen.html";
+  const offscreenUrl = chrome.runtime.getURL(offscreenPath);
 
-    // Check if offscreen document already exists
-    // Use chrome.runtime.getContexts() if available (Chrome 116+), otherwise fall back to clients.matchAll()
-    let offscreenExists = false;
+  // Chrome: use offscreen API
+  if (typeof chrome !== "undefined" && chrome.offscreen) {
+    try {
+      let offscreenExists = false;
 
-    if (chrome.runtime.getContexts) {
-      try {
-        const contexts = await chrome.runtime.getContexts({
-          contextTypes: ["OFFSCREEN_DOCUMENT"],
-          documentUrls: [offscreenUrl],
-        });
-        offscreenExists = contexts.length > 0;
-        if (offscreenExists) {
-          console.log(
-            "Offscreen document already exists (checked via getContexts)",
-          );
-          return;
-        }
-      } catch (getContextsError) {
-        console.log(
-          "getContexts API error, falling back to clients.matchAll():",
-          getContextsError,
-        );
-      }
-    }
-
-    // Fallback: use clients API (for Chrome < 116)
-    if (!offscreenExists) {
-      try {
-        const allClients = await self.clients.matchAll({
-          includeUncontrolled: true,
-        });
-        for (const client of allClients) {
-          if (
-            client.url &&
-            (client.url.includes("offscreen.html") ||
-              client.url === offscreenUrl)
-          ) {
+      if (chrome.runtime.getContexts) {
+        try {
+          const contexts = await chrome.runtime.getContexts({
+            contextTypes: ["OFFSCREEN_DOCUMENT"],
+            documentUrls: [offscreenUrl],
+          });
+          offscreenExists = contexts.length > 0;
+          if (offscreenExists) {
             console.log(
-              "Offscreen document already exists (checked via clients.matchAll)",
+              "Offscreen document already exists (checked via getContexts)",
             );
             return;
           }
+        } catch (getContextsError) {
+          console.log(
+            "getContexts API error, falling back to clients.matchAll():",
+            getContextsError,
+          );
         }
-      } catch (clientsError) {
-        // clients API might not be available, continue to create
-        console.log(
-          "Could not check existing clients, proceeding to create offscreen document",
-        );
       }
+
+      if (!offscreenExists) {
+        try {
+          const allClients = await self.clients.matchAll({
+            includeUncontrolled: true,
+          });
+          for (const client of allClients) {
+            if (
+              client.url &&
+              (client.url.includes("offscreen.html") ||
+                client.url === offscreenUrl)
+            ) {
+              console.log(
+                "Offscreen document already exists (checked via clients.matchAll)",
+              );
+              return;
+            }
+          }
+        } catch (clientsError) {
+          console.log(
+            "Could not check existing clients, proceeding to create offscreen document",
+          );
+        }
+      }
+
+      console.log("Creating offscreen document at:", offscreenPath);
+      await chrome.offscreen.createDocument({
+        url: offscreenPath,
+        reasons: ["BLOBS"],
+        justification:
+          "Need to access IndexedDB and create blob URLs for downloads",
+      });
+      console.log("Offscreen document created successfully");
+      await new Promise((resolve) => setTimeout(resolve, 800));
+    } catch (error) {
+      console.error("Failed to create offscreen document:", error);
+      throw error;
     }
+    return;
+  }
 
-    // Create offscreen document
-    // Note: URL is relative to extension root
-    console.log("Creating offscreen document at:", offscreenPath);
-    await chrome.offscreen.createDocument({
-      url: offscreenPath,
-      reasons: ["BLOBS"], // Using BLOBS since we're using URL.createObjectURL
-      justification:
-        "Need to access IndexedDB and create blob URLs for downloads",
+  // Firefox: use a hidden iframe in the background page (same offscreen page, no offscreen API)
+  if (typeof document === "undefined" || !document.body) {
+    throw new Error(
+      "Firefox background has no document (cannot create offscreen iframe).",
+    );
+  }
+
+  if (firefoxOffscreenIframe && document.contains(firefoxOffscreenIframe)) {
+    const ready = await pingOffscreenDocument();
+    if (ready) {
+      console.log("Firefox: reusing existing hidden offscreen iframe");
+      return;
+    }
+    firefoxOffscreenIframe.remove();
+    firefoxOffscreenIframe = null;
+  }
+
+  try {
+    console.log("Firefox: creating hidden iframe for offscreen page");
+    const iframe = document.createElement("iframe");
+    iframe.src = offscreenUrl;
+    iframe.style.setProperty("position", "fixed");
+    iframe.style.setProperty("left", "-9999px");
+    iframe.style.setProperty("top", "0");
+    iframe.style.setProperty("width", "1px");
+    iframe.style.setProperty("height", "1px");
+    iframe.style.setProperty("border", "none");
+    iframe.style.setProperty("visibility", "hidden");
+    iframe.style.setProperty("pointer-events", "none");
+    document.body.appendChild(iframe);
+    firefoxOffscreenIframe = iframe;
+
+    await new Promise((resolve, reject) => {
+      iframe.onload = () => resolve();
+      iframe.onerror = () =>
+        reject(new Error("Offscreen iframe failed to load"));
     });
-    console.log("Offscreen document created successfully");
+    await new Promise((resolve) => setTimeout(resolve, 600));
 
-    // Wait for script to load and message listener to be set up
-    // chrome.offscreen.createDocument resolves when HTML loads, but script execution is async
-    // Give it time to load, execute, and set up the message listener
-    await new Promise((resolve) => setTimeout(resolve, 800));
+    const ready = await pingOffscreenDocument();
+    if (!ready) {
+      throw new Error("Hidden offscreen iframe did not respond to ping");
+    }
+    console.log("Firefox: hidden offscreen iframe ready");
   } catch (error) {
-    console.error("Failed to create offscreen document:", error);
+    if (firefoxOffscreenIframe && firefoxOffscreenIframe.parentNode) {
+      firefoxOffscreenIframe.remove();
+    }
+    firefoxOffscreenIframe = null;
+    console.error("Failed to create Firefox hidden offscreen iframe:", error);
     throw error;
   }
 }

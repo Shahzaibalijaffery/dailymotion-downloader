@@ -14,6 +14,7 @@ const filesToInclude = [
   "background/offscreen.html",
   "background/offscreen.js",
   "ffmpeg-helper-umd.cjs",
+  "ffmpeg-helper-umd.js",
   "content/utils.js",
   "content/videoExtraction.js",
   "content/restoreDownloads.js",
@@ -33,51 +34,72 @@ const filesToInclude = [
   "assets/feed-download-icon.png",
 ];
 
-function createBundle() {
-  const outputPath = path.join(__dirname, "dist", "dailymotion-downloader.zip");
+/**
+ * Create a zip from dist/. For Firefox, use manifest.firefox.json as manifest.json.
+ * @param {'chrome'|'firefox'} target
+ * @returns {Promise<void>}
+ */
+function createBundle(target = "chrome") {
+  const isFirefox = target === "firefox";
+  const zipName = isFirefox
+    ? "dailymotion-downloader-firefox.zip"
+    : "dailymotion-downloader-chrome.zip";
+  const outputPath = path.join(__dirname, "dist", zipName);
   const output = fs.createWriteStream(outputPath);
   const archive = archiver("zip", {
-    zlib: { level: 9 }, // Maximum compression
+    zlib: { level: 9 },
   });
 
-  output.on("close", () => {
-    const sizeInMB = (archive.pointer() / 1024 / 1024).toFixed(2);
-    console.log(`✅ Bundle created successfully!`);
-    console.log(`📦 File: ${path.basename(outputPath)}`);
-    console.log(`📊 Size: ${sizeInMB} MB`);
-    console.log(`📝 Total files: ${archive.pointer()} bytes\n`);
-  });
+  return new Promise((resolve, reject) => {
+    output.on("close", () => {
+      const sizeInMB = (archive.pointer() / 1024 / 1024).toFixed(2);
+      console.log(
+        `✅ ${isFirefox ? "Firefox" : "Chrome"} bundle: ${path.basename(outputPath)} (${sizeInMB} MB)`,
+      );
+      resolve();
+    });
 
-  archive.on("error", (err) => {
-    throw err;
-  });
+    archive.on("error", reject);
+    archive.pipe(output);
 
-  archive.pipe(output);
+    console.log(
+      `📦 Creating ${isFirefox ? "Firefox" : "Chrome"} bundle...`,
+    );
 
-  // Add files from dist directory (maintain directory structure)
-  console.log("📦 Creating bundle from dist/ directory...");
-  filesToInclude.forEach((file) => {
-    const filePath = path.join(__dirname, "dist", file);
-    if (fs.existsSync(filePath)) {
-      // Preserve directory structure in zip
-      archive.file(filePath, { name: file });
-      console.log(`   ✓ Added: ${file}`);
+    // Manifest: Chrome uses dist/manifest.json, Firefox uses manifest.firefox.json
+    const manifestSource = isFirefox
+      ? path.join(__dirname, "manifest.firefox.json")
+      : path.join(__dirname, "dist", "manifest.json");
+    if (fs.existsSync(manifestSource)) {
+      archive.file(manifestSource, { name: "manifest.json" });
+      console.log(`   ✓ Added: manifest.json (${target})`);
     } else {
-      console.warn(`   ⚠️  Warning: ${file} not found in dist/, skipping...`);
+      console.warn(`   ⚠️  manifest not found: ${manifestSource}`);
     }
-  });
 
-  // Add source maps if they exist (maintain directory structure)
-  const sourceMapFiles = filesToInclude.filter((f) => f.endsWith(".js"));
-  sourceMapFiles.forEach((file) => {
-    const mapPath = path.join(__dirname, "dist", file + ".map");
-    if (fs.existsSync(mapPath)) {
-      archive.file(mapPath, { name: file + ".map" });
-      console.log(`   ✓ Added: ${file}.map`);
-    }
-  });
+    // Rest of files from dist (skip manifest.json for Firefox, we already added it)
+    const otherFiles = filesToInclude.filter((f) => f !== "manifest.json");
+    otherFiles.forEach((file) => {
+      const filePath = path.join(__dirname, "dist", file);
+      if (fs.existsSync(filePath)) {
+        archive.file(filePath, { name: file });
+        console.log(`   ✓ Added: ${file}`);
+      } else {
+        console.warn(`   ⚠️  Warning: ${file} not found in dist/, skipping...`);
+      }
+    });
 
-  archive.finalize();
+    const sourceMapFiles = otherFiles.filter((f) => f.endsWith(".js"));
+    sourceMapFiles.forEach((file) => {
+      const mapPath = path.join(__dirname, "dist", file + ".map");
+      if (fs.existsSync(mapPath)) {
+        archive.file(mapPath, { name: file + ".map" });
+        console.log(`   ✓ Added: ${file}.map`);
+      }
+    });
+
+    archive.finalize();
+  });
 }
 
 // Check if dist directory exists
@@ -88,5 +110,14 @@ if (!fs.existsSync(path.join(__dirname, "dist"))) {
   process.exit(1);
 }
 
-console.log("🚀 Starting extension bundling...\n");
-createBundle();
+async function run() {
+  console.log("🚀 Starting extension bundling...\n");
+  await createBundle("chrome");
+  await createBundle("firefox");
+  console.log("\n✅ Done. Load dailymotion-downloader-firefox.zip in Firefox (Load Temporary Add-on → select zip).");
+}
+
+run().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

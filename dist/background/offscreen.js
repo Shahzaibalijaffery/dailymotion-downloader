@@ -14,8 +14,61 @@ console.log("========================================");
 
 // Only FFmpegHelper (ffmpeg-helper-umd.cjs). No wasm, core, or 814.
 // Helper URL and protocol match Royal Video Downloader (convert-to-mp3, exec).
-const FFmpegHelperClass = typeof FFmpegHelper !== "undefined" ? FFmpegHelper : null;
+// Use let so we can set after dynamic load (e.g. Firefox tab where the HTML script tag may not run).
+let FFmpegHelperClass = typeof FFmpegHelper !== "undefined" ? FFmpegHelper : null;
 const FFMPEG_HELPER_URL = "https://helper.addoncrop.com/?build=full";
+
+let loadFfmpegHelperPromise = null;
+
+/**
+ * Load a single script by URL. Resolves when loaded; sets FFmpegHelperClass if FFmpegHelper is defined.
+ * @param {string} src - Full URL (e.g. from chrome.runtime.getURL)
+ * @returns {Promise<void>}
+ */
+function loadOneScript(src) {
+  return new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = src;
+    script.onload = () => {
+      FFmpegHelperClass = typeof FFmpegHelper !== "undefined" ? FFmpegHelper : null;
+      if (FFmpegHelperClass) {
+        console.log("FFmpegHelper loaded dynamically (e.g. Firefox tab).");
+      }
+      resolve();
+    };
+    script.onerror = () => reject(new Error("Failed to load script: " + src));
+    (document.head || document.documentElement).appendChild(script);
+  });
+}
+
+/**
+ * Load ffmpeg-helper via script tag (fallback when HTML script doesn't run, e.g. Firefox tab).
+ * Tries .js first (Firefox often blocks or mis-serves .cjs).
+ * @returns {Promise<void>}
+ */
+function loadFfmpegHelperScript() {
+  if (FFmpegHelperClass) return Promise.resolve();
+  if (typeof FFmpegHelper !== "undefined") {
+    FFmpegHelperClass = FFmpegHelper;
+    return Promise.resolve();
+  }
+  if (loadFfmpegHelperPromise) return loadFfmpegHelperPromise;
+  const getURL = typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getURL
+    ? (path) => chrome.runtime.getURL(path)
+    : (path) => "/" + path;
+  loadFfmpegHelperPromise = (async () => {
+    for (const name of ["ffmpeg-helper-umd.js", "ffmpeg-helper-umd.cjs"]) {
+      try {
+        await loadOneScript(getURL(name));
+        if (FFmpegHelperClass) return;
+      } catch (e) {
+        console.warn("Load " + name + " failed:", e.message);
+      }
+    }
+    throw new Error("Failed to load FFmpeg helper (tried .js and .cjs).");
+  })();
+  return loadFfmpegHelperPromise;
+}
 
 // Set up message listener immediately (don't wait for DOM)
 // This ensures the listener is ready as soon as possible
@@ -301,32 +354,40 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
 
 console.log("✅ Message listener set up successfully!");
 
-// Send ready signal to background script (include FFmpeg helper availability)
-const ffmpegAvailable = FFmpegHelperClass !== null;
-console.log("Sending offscreenReady signal to background script...");
-try {
-  chrome.runtime.sendMessage(
-    { action: "offscreenReady", ffmpegAvailable },
-    (response) => {
-      if (chrome.runtime.lastError) {
-        console.warn(
-          "❌ Error sending offscreenReady:",
-          chrome.runtime.lastError.message,
-        );
-      } else {
-        console.log("✅ Offscreen document ready signal sent successfully!");
-      }
-    },
-  );
-} catch (error) {
-  console.error("❌ Error sending offscreenReady:", error);
-}
-
-console.log("========================================");
-console.log("✅ Offscreen document fully initialized and ready!");
-console.log("FFmpegHelper available:", FFmpegHelperClass !== null);
-console.log("Message listener is active and waiting for messages");
-console.log("========================================");
+// If helper not loaded (e.g. Firefox tab), try loading it before sending ready
+(async function sendReadyWhenPossible() {
+  if (!FFmpegHelperClass) {
+    try {
+      await loadFfmpegHelperScript();
+    } catch (e) {
+      console.warn("Could not load FFmpeg helper at init:", e);
+    }
+  }
+  const ffmpegAvailable = FFmpegHelperClass !== null;
+  console.log("Sending offscreenReady signal to background script...");
+  try {
+    chrome.runtime.sendMessage(
+      { action: "offscreenReady", ffmpegAvailable },
+      (response) => {
+        if (chrome.runtime.lastError) {
+          console.warn(
+            "❌ Error sending offscreenReady:",
+            chrome.runtime.lastError.message,
+          );
+        } else {
+          console.log("✅ Offscreen document ready signal sent successfully!");
+        }
+      },
+    );
+  } catch (error) {
+    console.error("❌ Error sending offscreenReady:", error);
+  }
+  console.log("========================================");
+  console.log("✅ Offscreen document fully initialized and ready!");
+  console.log("FFmpegHelper available:", FFmpegHelperClass !== null);
+  console.log("Message listener is active and waiting for messages");
+  console.log("========================================");
+})();
 
 async function handleBlobDownload(blobId, filename, mimeType, expectedSize) {
   try {
@@ -416,6 +477,9 @@ function withTimeout(promise, ms, message) {
 /** Ensure FFmpeg helper iframe is ready (used by checkFFmpeg). No wasm, core, or 814. */
 async function ensureFFmpegReady() {
   if (!FFmpegHelperClass) {
+    await loadFfmpegHelperScript();
+  }
+  if (!FFmpegHelperClass) {
     throw new Error("FFmpegHelper not loaded. Check offscreen script order.");
   }
   const ffmpeg = new FFmpegHelperClass(FFMPEG_HELPER_URL, "error");
@@ -437,9 +501,7 @@ function openBlobsDB() {
 
 /** Convert TS blob to MP4 via helper. API: ffmpeg.run(action, data, transferList, onProgress) -> { outputBuffer, extension, mimeType } */
 async function handleConvertToMp4(blobId, downloadId, onProgress) {
-  if (!FFmpegHelperClass) {
-    throw new Error("FFmpegHelper not loaded. Check offscreen script order.");
-  }
+  await ensureFFmpegReady();
   const db = await openBlobsDB();
   const arrayBuffer = await new Promise((resolve, reject) => {
     const tx = db.transaction(["blobs"], "readonly");
@@ -507,9 +569,7 @@ async function handleConvertToMp4(blobId, downloadId, onProgress) {
  * Convert video (TS or MP4) in IDB to MP3 via helper. Used when user selects "MP3" in download dropdown.
  */
 async function handleConvertToMp3(blobId, inputFormat) {
-  if (!FFmpegHelperClass) {
-    throw new Error("FFmpegHelper not loaded. Check offscreen script order.");
-  }
+  await ensureFFmpegReady();
   const db = await openBlobsDB();
   const arrayBuffer = await new Promise((resolve, reject) => {
     const tx = db.transaction(["blobs"], "readonly");

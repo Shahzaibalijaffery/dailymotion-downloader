@@ -25,6 +25,7 @@ const copyFiles = [
   { src: 'popup/popup.css', dest: 'popup/popup.css' },
   { src: 'background/offscreen.html', dest: 'background/offscreen.html' },
   { src: 'ffmpeg-helper-umd.cjs', dest: 'ffmpeg-helper-umd.cjs' },
+  { src: 'ffmpeg-helper-umd.cjs', dest: 'ffmpeg-helper-umd.js' }, // .js copy for Firefox dynamic script load (some envs block .cjs)
   { src: 'icons/icon16.png', dest: 'icons/icon16.png' },
   { src: 'icons/icon48.png', dest: 'icons/icon48.png' },
   { src: 'icons/icon128.png', dest: 'icons/icon128.png' },
