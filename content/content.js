@@ -154,88 +154,37 @@ try {
   // ignore
 }
 
-// Initialize modules
-function initializeModules() {
-  // Only initialize in top frame
+let lastUrl = location.href;
+
+function runYourScriptAgain() {
+  console.log("[DM Downloader] runScriptAgain: running script again");
   if (window.self !== window.top) return;
-
-  // Initialize video extraction (handles network interception and DOM monitoring)
-  if (typeof initializeVideoExtraction === "function") {
-    initializeVideoExtraction();
-  }
-
-  // Initialize page tracking (handles URL monitoring and button verification)
-  if (typeof initializePageTracking === "function") {
-    initializePageTracking();
-  }
-
-  // Schedule restore active downloads
-  if (typeof scheduleRestoreActiveDownloads === "function") {
-    scheduleRestoreActiveDownloads();
-  }
-
-  // Inject download button only after React hydration (avoids React #418/#423)
-  const INJECT_DELAY_MS = 4500;
-  // if (typeof isFeedPage === "function" && isFeedPage()) {
-  //   console.log(
-  //     "[DM Downloader] Feed page detected, starting observer in",
-  //     INJECT_DELAY_MS,
-  //     "ms.",
-  //   );
-  //   // Optional: tiny on-page badge so you can confirm the script ran (right-click page → Inspect → Console to see logs)
-  //   try {
-  //     const badge = document.createElement("div");
-  //     badge.id = "dm-downloader-feed-badge";
-  //     badge.textContent = "DM Downloader: feed";
-  //     badge.style.cssText =
-  //       "position:fixed;top:8px;right:8px;background:#0066cc;color:#fff;padding:4px 8px;border-radius:4px;font-size:11px;z-index:2147483646;pointer-events:none;opacity:0.9;";
-  //     document.body.appendChild(badge);
-  //     setTimeout(() => badge.remove(), 2500);
-  //   } catch (e) {}
-  //   if (typeof startFeedDownloadButtonObserver === "function") {
-  //     if (document.readyState === "loading") {
-  //       document.addEventListener("DOMContentLoaded", () => {
-  //         if (isExtensionContextValid())
-  //           setTimeout(startFeedDownloadButtonObserver, INJECT_DELAY_MS);
-  //       });
-  //     } else {
-  //       if (isExtensionContextValid())
-  //         setTimeout(startFeedDownloadButtonObserver, INJECT_DELAY_MS);
-  //     }
-  //   }
-  // } else
-
-  if (isVideoPage() && typeof injectDownloadButton === "function") {
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", () => {
-        if (isExtensionContextValid()) {
-          setTimeout(() => {
-            if (typeof injectDownloadButton === "function") {
-              window.__dmInjectSource = "DOMContentLoaded";
-              injectDownloadButton();
-            }
-          }, INJECT_DELAY_MS);
-        }
-      });
-    } else {
-      if (isExtensionContextValid()) {
-        setTimeout(() => {
-          if (typeof injectDownloadButton === "function") {
-            window.__dmInjectSource = "initializeModules(ready)";
-            injectDownloadButton();
-          }
-        }, INJECT_DELAY_MS);
-      }
+  if (!isVideoPage()) return;
+  document
+    .querySelectorAll(
+      ".dm-page-download-wrapper, #vimeo-downloader-page-button-wrapper",
+    )
+    .forEach((w) => w.remove());
+  setTimeout(() => {
+    if (!isVideoPage() || !isExtensionContextValid()) return;
+    if (typeof injectDownloadButton === "function") {
+      window.__dmInjectSource = "runScriptAgain";
+      injectDownloadButton();
     }
-  }
+  }, 2500);
 }
 
-// Initialize when DOM is ready
-if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", initializeModules);
-} else {
-  initializeModules();
-}
+// Run once
+runYourScriptAgain();
+
+// Detect URL changes
+new MutationObserver(() => {
+  if (location.href !== lastUrl) {
+    lastUrl = location.href;
+    console.log("URL changed:", lastUrl);
+    runYourScriptAgain();
+  }
+}).observe(document, { childList: true, subtree: true });
 
 // Listen for messages from background script to handle blob downloads and download notifications
 chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -247,45 +196,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return false;
   }
 
-  // Background asks to (re)inject the download button (e.g. after programmatic inject so button shows without refresh)
-  if (request.action === "requestInjectButton") {
-    try {
-      // Trigger extraction first so background has fresh video data, then inject button
-      if (typeof scheduleExtract === "function") {
-        scheduleExtract("requestInjectButton");
-      } else if (typeof extractVideoConfig === "function") {
-        extractVideoConfig("requestInjectButton");
-      }
-      setTimeout(() => {
-        if (typeof injectDownloadButton === "function") {
-          window.__dmInjectSource = "requestInjectButton";
-          injectDownloadButton();
-        }
-      }, 500);
-      sendResponse({ success: true });
-    } catch (e) {
-      console.error("requestInjectButton failed:", e);
-      sendResponse({ success: false, error: e?.message || String(e) });
-    }
-    return false;
-  }
-
-  // Background asks for current page title (live document.title – more reliable than tab.title after SPA nav)
-  if (request.action === "getPageTitle") {
-    try {
-      const raw =
-        typeof document !== "undefined" && document.title ? document.title : "";
-      const title =
-        typeof cleanVideoTitle === "function"
-          ? cleanVideoTitle(raw)
-          : raw.trim() || null;
-      sendResponse({ success: true, title: title || null });
-    } catch (e) {
-      sendResponse({ success: false, title: null });
-    }
-    return true;
-  }
-
   // Feed: background detected a video JSON API call (e.g. geo.dailymotion.com/video/ID.json) – inject button in #homefeed for that video ID
   if (request.action === "feedVideoFromApi" && request.videoId) {
     try {
@@ -295,26 +205,6 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
       sendResponse({ ok: true });
     } catch (e) {
       sendResponse({ ok: false, error: e?.message || String(e) });
-    }
-    return true;
-  }
-
-  // Popup asks the page to (re)run extraction. This is critical for:
-  // - slow internet (URLs appear late)
-  // - lazy-loaded player/config
-  // - SPA navigation where the content script is already injected
-  if (request.action === "triggerVideoExtraction") {
-    try {
-      // Prefer throttled scheduler if available
-      if (typeof scheduleExtract === "function") {
-        scheduleExtract(request.reason || "popup");
-      } else if (typeof extractVideoConfig === "function") {
-        extractVideoConfig(request.reason || "popup");
-      }
-      sendResponse({ success: true });
-    } catch (e) {
-      console.error("triggerVideoExtraction failed:", e);
-      sendResponse({ success: false, error: e?.message || String(e) });
     }
     return true;
   }
@@ -504,270 +394,270 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     return true;
   }
 
-  if (request.action === "downloadBlobFromIndexedDB") {
-    // Retrieve blob from IndexedDB and create blob URL
-    (async () => {
-      try {
-        const blobId = request.blobId;
-        const filename = request.filename;
-        const mimeType = request.mimeType || "video/mp4";
-        const expectedSize = request.expectedSize;
+  // if (request.action === "downloadBlobFromIndexedDB") {
+  //   // Retrieve blob from IndexedDB and create blob URL
+  //   (async () => {
+  //     try {
+  //       const blobId = request.blobId;
+  //       const filename = request.filename;
+  //       const mimeType = request.mimeType || "video/mp4";
+  //       const expectedSize = request.expectedSize;
 
-        console.log(`Retrieving blob from IndexedDB with ID: ${blobId}...`);
+  //       console.log(`Retrieving blob from IndexedDB with ID: ${blobId}...`);
 
-        // First, check if blob is ready signal exists in chrome.storage.local
-        const blobReady = await new Promise((resolve) => {
-          chrome.storage.local.get([`blobReady_${blobId}`], (result) => {
-            resolve(result[`blobReady_${blobId}`] === true);
-          });
-        });
+  //       // First, check if blob is ready signal exists in chrome.storage.local
+  //       const blobReady = await new Promise((resolve) => {
+  //         chrome.storage.local.get([`blobReady_${blobId}`], (result) => {
+  //           resolve(result[`blobReady_${blobId}`] === true);
+  //         });
+  //       });
 
-        if (!blobReady) {
-          console.log("Blob not ready yet, waiting for signal...");
-          // Wait for blob ready signal (polling)
-          let signalRetries = 20;
-          let signalWaitTime = 500;
-          while (!blobReady && signalRetries > 0) {
-            await new Promise((resolve) => setTimeout(resolve, signalWaitTime));
-            const checkReady = await new Promise((resolve) => {
-              safeStorageGet([`blobReady_${blobId}`], (result) => {
-                resolve(result[`blobReady_${blobId}`] === true);
-              });
-            });
-            if (checkReady) break;
-            signalRetries--;
-            signalWaitTime = Math.min(signalWaitTime * 1.2, 2000);
-          }
-        }
+  //       if (!blobReady) {
+  //         console.log("Blob not ready yet, waiting for signal...");
+  //         // Wait for blob ready signal (polling)
+  //         let signalRetries = 20;
+  //         let signalWaitTime = 500;
+  //         while (!blobReady && signalRetries > 0) {
+  //           await new Promise((resolve) => setTimeout(resolve, signalWaitTime));
+  //           const checkReady = await new Promise((resolve) => {
+  //             safeStorageGet([`blobReady_${blobId}`], (result) => {
+  //               resolve(result[`blobReady_${blobId}`] === true);
+  //             });
+  //           });
+  //           if (checkReady) break;
+  //           signalRetries--;
+  //           signalWaitTime = Math.min(signalWaitTime * 1.2, 2000);
+  //         }
+  //       }
 
-        // Retry mechanism in case of timing issues
-        // IndexedDB isolation between service worker and content script requires longer waits
-        // But we reduce retries since offscreen document is now primary method
-        let arrayBuffer = null;
-        let retries = 3; // Reduced retries since this is now fallback only
-        let waitTime = 1000; // Reduced initial wait time
+  //       // Retry mechanism in case of timing issues
+  //       // IndexedDB isolation between service worker and content script requires longer waits
+  //       // But we reduce retries since offscreen document is now primary method
+  //       let arrayBuffer = null;
+  //       let retries = 3; // Reduced retries since this is now fallback only
+  //       let waitTime = 1000; // Reduced initial wait time
 
-        while (!arrayBuffer && retries > 0) {
-          try {
-            // Check if extension context is still valid
-            if (!chrome.runtime || !chrome.runtime.id) {
-              throw new Error("Extension context invalidated");
-            }
+  //       while (!arrayBuffer && retries > 0) {
+  //         try {
+  //           // Check if extension context is still valid
+  //           if (!chrome.runtime || !chrome.runtime.id) {
+  //             throw new Error("Extension context invalidated");
+  //           }
 
-            // Open IndexedDB
-            const db = await new Promise((resolve, reject) => {
-              const request = indexedDB.open("DailymotionDownloaderDB", 1);
-              request.onerror = () => reject(request.error);
-              request.onsuccess = () => resolve(request.result);
-              request.onupgradeneeded = (event) => {
-                const db = event.target.result;
-                if (!db.objectStoreNames.contains("blobs")) {
-                  db.createObjectStore("blobs");
-                }
-              };
-            });
+  //           // Open IndexedDB
+  //           const db = await new Promise((resolve, reject) => {
+  //             const request = indexedDB.open("DailymotionDownloaderDB", 1);
+  //             request.onerror = () => reject(request.error);
+  //             request.onsuccess = () => resolve(request.result);
+  //             request.onupgradeneeded = (event) => {
+  //               const db = event.target.result;
+  //               if (!db.objectStoreNames.contains("blobs")) {
+  //                 db.createObjectStore("blobs");
+  //               }
+  //             };
+  //           });
 
-            // Retrieve ArrayBuffer
-            const transaction = db.transaction(["blobs"], "readonly");
-            const store = transaction.objectStore("blobs");
+  //           // Retrieve ArrayBuffer
+  //           const transaction = db.transaction(["blobs"], "readonly");
+  //           const store = transaction.objectStore("blobs");
 
-            const result = await new Promise((resolve, reject) => {
-              const request = store.get(blobId);
-              request.onsuccess = () => {
-                const data = request.result;
-                if (!data) {
-                  const attemptNum = 4 - retries;
-                  console.warn(
-                    `Blob not found (attempt ${attemptNum}/3), waiting ${waitTime}ms before retry...`,
-                  );
-                  resolve(null);
-                } else {
-                  console.log(`Blob found! Size: ${data.byteLength} bytes`);
-                  resolve(data);
-                }
-              };
-              request.onerror = () => {
-                console.error("IndexedDB read error:", request.error);
-                reject(request.error || new Error("IndexedDB read error"));
-              };
-            });
+  //           const result = await new Promise((resolve, reject) => {
+  //             const request = store.get(blobId);
+  //             request.onsuccess = () => {
+  //               const data = request.result;
+  //               if (!data) {
+  //                 const attemptNum = 4 - retries;
+  //                 console.warn(
+  //                   `Blob not found (attempt ${attemptNum}/3), waiting ${waitTime}ms before retry...`,
+  //                 );
+  //                 resolve(null);
+  //               } else {
+  //                 console.log(`Blob found! Size: ${data.byteLength} bytes`);
+  //                 resolve(data);
+  //               }
+  //             };
+  //             request.onerror = () => {
+  //               console.error("IndexedDB read error:", request.error);
+  //               reject(request.error || new Error("IndexedDB read error"));
+  //             };
+  //           });
 
-            db.close();
+  //           db.close();
 
-            if (result && result instanceof ArrayBuffer) {
-              arrayBuffer = result;
-              break;
-            }
+  //           if (result && result instanceof ArrayBuffer) {
+  //             arrayBuffer = result;
+  //             break;
+  //           }
 
-            retries--;
-            if (retries > 0) {
-              console.log(`Waiting ${waitTime}ms before retry...`);
-              await new Promise((resolve) => setTimeout(resolve, waitTime));
-              // Increase wait time for subsequent retries (exponential backoff)
-              waitTime = Math.min(waitTime * 1.5, 5000);
-            }
-          } catch (dbError) {
-            // Handle IndexedDB errors or extension context invalidation
-            if (
-              dbError.message &&
-              dbError.message.includes("Extension context invalidated")
-            ) {
-              console.error(
-                "Extension context invalidated, cannot retrieve blob:",
-                dbError,
-              );
-              sendResponse({
-                success: false,
-                error:
-                  "Extension context invalidated. Please reload the extension and try again.",
-              });
-              return;
-            }
+  //           retries--;
+  //           if (retries > 0) {
+  //             console.log(`Waiting ${waitTime}ms before retry...`);
+  //             await new Promise((resolve) => setTimeout(resolve, waitTime));
+  //             // Increase wait time for subsequent retries (exponential backoff)
+  //             waitTime = Math.min(waitTime * 1.5, 5000);
+  //           }
+  //         } catch (dbError) {
+  //           // Handle IndexedDB errors or extension context invalidation
+  //           if (
+  //             dbError.message &&
+  //             dbError.message.includes("Extension context invalidated")
+  //           ) {
+  //             console.error(
+  //               "Extension context invalidated, cannot retrieve blob:",
+  //               dbError,
+  //             );
+  //             sendResponse({
+  //               success: false,
+  //               error:
+  //                 "Extension context invalidated. Please reload the extension and try again.",
+  //             });
+  //             return;
+  //           }
 
-            console.error("IndexedDB operation error:", dbError);
-            retries--;
-            if (retries > 0) {
-              await new Promise((resolve) => setTimeout(resolve, waitTime));
-              waitTime = Math.min(waitTime * 1.5, 5000);
-            } else {
-              throw dbError;
-            }
-          }
-        }
+  //           console.error("IndexedDB operation error:", dbError);
+  //           retries--;
+  //           if (retries > 0) {
+  //             await new Promise((resolve) => setTimeout(resolve, waitTime));
+  //             waitTime = Math.min(waitTime * 1.5, 5000);
+  //           } else {
+  //             throw dbError;
+  //           }
+  //         }
+  //       }
 
-        if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
-          throw new Error(
-            `Failed to retrieve blob from IndexedDB after 3 attempts. Blob ID: ${blobId}. This might be due to IndexedDB isolation between service worker and content script. Try using the offscreen document method (primary).`,
-          );
-        }
+  //       if (!arrayBuffer || !(arrayBuffer instanceof ArrayBuffer)) {
+  //         throw new Error(
+  //           `Failed to retrieve blob from IndexedDB after 3 attempts. Blob ID: ${blobId}. This might be due to IndexedDB isolation between service worker and content script. Try using the offscreen document method (primary).`,
+  //         );
+  //       }
 
-        const actualSize = arrayBuffer.byteLength;
-        const sizeMB = Math.round(actualSize / 1024 / 1024);
-        console.log(
-          `Retrieved ${sizeMB}MB blob (${actualSize} bytes) from IndexedDB`,
-        );
+  //       const actualSize = arrayBuffer.byteLength;
+  //       const sizeMB = Math.round(actualSize / 1024 / 1024);
+  //       console.log(
+  //         `Retrieved ${sizeMB}MB blob (${actualSize} bytes) from IndexedDB`,
+  //       );
 
-        if (expectedSize && actualSize !== expectedSize) {
-          console.warn(
-            `Size mismatch: expected ${expectedSize}, got ${actualSize}`,
-          );
-        }
+  //       if (expectedSize && actualSize !== expectedSize) {
+  //         console.warn(
+  //           `Size mismatch: expected ${expectedSize}, got ${actualSize}`,
+  //         );
+  //       }
 
-        // Create blob and blob URL
-        const blob = new Blob([arrayBuffer], { type: mimeType });
+  //       // Create blob and blob URL
+  //       const blob = new Blob([arrayBuffer], { type: mimeType });
 
-        // Verify blob size
-        if (blob.size !== actualSize) {
-          console.error(
-            `Blob size mismatch: blob=${blob.size}, arrayBuffer=${actualSize}`,
-          );
-        }
+  //       // Verify blob size
+  //       if (blob.size !== actualSize) {
+  //         console.error(
+  //           `Blob size mismatch: blob=${blob.size}, arrayBuffer=${actualSize}`,
+  //         );
+  //       }
 
-        console.log(`Created blob (${blob.size} bytes), creating blob URL...`);
-        const blobUrl = URL.createObjectURL(blob);
+  //       console.log(`Created blob (${blob.size} bytes), creating blob URL...`);
+  //       const blobUrl = URL.createObjectURL(blob);
 
-        console.log(
-          `Blob URL created: ${blobUrl.substring(0, 50)}..., starting download...`,
-        );
+  //       console.log(
+  //         `Blob URL created: ${blobUrl.substring(0, 50)}..., starting download...`,
+  //       );
 
-        // Download directly from content script (has access to chrome.downloads)
-        // Try with saveAs first, fallback to without saveAs if it fails
-        const attemptDownload = (useSaveAs) => {
-          chrome.downloads.download(
-            {
-              url: blobUrl,
-              filename: filename,
-              saveAs: useSaveAs,
-            },
-            (downloadId) => {
-              if (chrome.runtime.lastError) {
-                const error = chrome.runtime.lastError.message;
-                console.error(`Download failed (saveAs: ${useSaveAs}):`, error);
+  //       // Download directly from content script (has access to chrome.downloads)
+  //       // Try with saveAs first, fallback to without saveAs if it fails
+  //       const attemptDownload = (useSaveAs) => {
+  //         chrome.downloads.download(
+  //           {
+  //             url: blobUrl,
+  //             filename: filename,
+  //             saveAs: useSaveAs,
+  //           },
+  //           (downloadId) => {
+  //             if (chrome.runtime.lastError) {
+  //               const error = chrome.runtime.lastError.message;
+  //               console.error(`Download failed (saveAs: ${useSaveAs}):`, error);
 
-                // If saveAs failed, try without saveAs
-                if (useSaveAs) {
-                  console.log(
-                    "Retrying download without saveAs (direct to Downloads folder)...",
-                  );
-                  setTimeout(() => attemptDownload(false), 500);
-                } else {
-                  // Both attempts failed
-                  URL.revokeObjectURL(blobUrl);
-                  sendResponse({ success: false, error: error });
-                }
-              } else if (!downloadId) {
-                console.error("Download returned no ID");
-                if (useSaveAs) {
-                  console.log("Retrying download without saveAs...");
-                  setTimeout(() => attemptDownload(false), 500);
-                } else {
-                  URL.revokeObjectURL(blobUrl);
-                  sendResponse({
-                    success: false,
-                    error: "No download ID returned",
-                  });
-                }
-              } else {
-                console.log(
-                  `Download started successfully with ID: ${downloadId} (saveAs: ${useSaveAs})`,
-                );
+  //               // If saveAs failed, try without saveAs
+  //               if (useSaveAs) {
+  //                 console.log(
+  //                   "Retrying download without saveAs (direct to Downloads folder)...",
+  //                 );
+  //                 setTimeout(() => attemptDownload(false), 500);
+  //               } else {
+  //                 // Both attempts failed
+  //                 URL.revokeObjectURL(blobUrl);
+  //                 sendResponse({ success: false, error: error });
+  //               }
+  //             } else if (!downloadId) {
+  //               console.error("Download returned no ID");
+  //               if (useSaveAs) {
+  //                 console.log("Retrying download without saveAs...");
+  //                 setTimeout(() => attemptDownload(false), 500);
+  //               } else {
+  //                 URL.revokeObjectURL(blobUrl);
+  //                 sendResponse({
+  //                   success: false,
+  //                   error: "No download ID returned",
+  //                 });
+  //               }
+  //             } else {
+  //               console.log(
+  //                 `Download started successfully with ID: ${downloadId} (saveAs: ${useSaveAs})`,
+  //               );
 
-                // Verify download actually started by checking its state after a moment
-                setTimeout(() => {
-                  chrome.downloads.search({ id: downloadId }, (results) => {
-                    if (results && results.length > 0) {
-                      const download = results[0];
-                      console.log(
-                        "Download state check:",
-                        download.state,
-                        "Progress:",
-                        download.bytesReceived,
-                        "/",
-                        download.totalBytes,
-                      );
+  //               // Verify download actually started by checking its state after a moment
+  //               setTimeout(() => {
+  //                 chrome.downloads.search({ id: downloadId }, (results) => {
+  //                   if (results && results.length > 0) {
+  //                     const download = results[0];
+  //                     console.log(
+  //                       "Download state check:",
+  //                       download.state,
+  //                       "Progress:",
+  //                       download.bytesReceived,
+  //                       "/",
+  //                       download.totalBytes,
+  //                     );
 
-                      if (download.state === "interrupted") {
-                        console.error(
-                          "Download was interrupted:",
-                          download.error,
-                        );
-                        // If interrupted and we used saveAs, retry without saveAs
-                        if (useSaveAs && download.error !== "USER_CANCELED") {
-                          console.log(
-                            "Download interrupted, retrying without saveAs...",
-                          );
-                          chrome.downloads.removeFile(downloadId, () => {
-                            attemptDownload(false);
-                          });
-                          return;
-                        }
-                      }
-                    }
-                  });
-                }, 2000);
+  //                     if (download.state === "interrupted") {
+  //                       console.error(
+  //                         "Download was interrupted:",
+  //                         download.error,
+  //                       );
+  //                       // If interrupted and we used saveAs, retry without saveAs
+  //                       if (useSaveAs && download.error !== "USER_CANCELED") {
+  //                         console.log(
+  //                           "Download interrupted, retrying without saveAs...",
+  //                         );
+  //                         chrome.downloads.removeFile(downloadId, () => {
+  //                           attemptDownload(false);
+  //                         });
+  //                         return;
+  //                       }
+  //                     }
+  //                   }
+  //                 });
+  //               }, 2000);
 
-                // Revoke blob URL after a delay to ensure download completes
-                // Chrome will keep the blob URL alive as long as the download is active
-                setTimeout(() => {
-                  URL.revokeObjectURL(blobUrl);
-                  console.log("Blob URL revoked");
-                }, 300000); // 5 minutes for large files
+  //               // Revoke blob URL after a delay to ensure download completes
+  //               // Chrome will keep the blob URL alive as long as the download is active
+  //               setTimeout(() => {
+  //                 URL.revokeObjectURL(blobUrl);
+  //                 console.log("Blob URL revoked");
+  //               }, 300000); // 5 minutes for large files
 
-                sendResponse({ success: true });
-              }
-            },
-          );
-        };
+  //               sendResponse({ success: true });
+  //             }
+  //           },
+  //         );
+  //       };
 
-        // Start with saveAs: true, will fallback to false if needed
-        attemptDownload(true);
-      } catch (error) {
-        console.error("Failed to download blob from IndexedDB:", error);
-        sendResponse({ success: false, error: error.message });
-      }
-    })();
+  //       // Start with saveAs: true, will fallback to false if needed
+  //       attemptDownload(true);
+  //     } catch (error) {
+  //       console.error("Failed to download blob from IndexedDB:", error);
+  //       sendResponse({ success: false, error: error.message });
+  //     }
+  //   })();
 
-    return true; // Keep channel open for async response
-  }
+  //   return true; // Keep channel open for async response
+  // }
   return false;
 });

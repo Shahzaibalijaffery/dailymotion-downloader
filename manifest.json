@@ -29,15 +29,17 @@
   "content_scripts": [
     {
       "matches": ["*://*.dailymotion.com/*"],
+      "css": [
+        "content/downloadButton.css",
+        "content/downloadNotifications.css"
+      ],
       "js": [
         "scripts/utils.js",
         "scripts/storage.js",
         "scripts/messaging.js",
         "content/utils.js",
-        "content/videoExtraction.js",
         "content/restoreDownloads.js",
         "content/downloadNotifications.js",
-        "content/pageTracking.js",
         "content/downloadButton.js",
         "content/content.js"
       ],

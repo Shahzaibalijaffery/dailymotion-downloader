@@ -130,11 +130,10 @@ function loadVideoData(showLoading = true, forceRefresh = false) {
 }
 
 /**
- * Request content script to actively detect videos
- * This helps with lazy loading scenarios where videos load after page load
+ * Request content script to refresh video detection (no-op; video URLs come from service worker).
+ * Kept for API compatibility with popup UI.
  */
 function requestVideoDetection(tabId) {
-  // Send message to content script to trigger video extraction
   chrome.tabs.sendMessage(
     tabId,
     { action: "triggerVideoExtraction", reason: "popup-request" },
@@ -562,23 +561,23 @@ function displayVideos(videoData) {
       });
 
       // Convert map back to array and sort: prefer MP4 over HLS, then by quality (highest first)
-      const deduplicatedQualities = Array.from(uniqueByQualityLabel.values()).sort(
-        (a, b) => {
-          if (!a || !b) return 0; // Safety check
+      const deduplicatedQualities = Array.from(
+        uniqueByQualityLabel.values(),
+      ).sort((a, b) => {
+        if (!a || !b) return 0; // Safety check
 
-          const aIsMP4 = isMP4(a.type); // Using utility function
-          const bIsMP4 = isMP4(b.type); // Using utility function
+        const aIsMP4 = isMP4(a.type); // Using utility function
+        const bIsMP4 = isMP4(b.type); // Using utility function
 
-          // Prefer MP4 over HLS
-          if (aIsMP4 && !bIsMP4) return -1;
-          if (!aIsMP4 && bIsMP4) return 1;
+        // Prefer MP4 over HLS
+        if (aIsMP4 && !bIsMP4) return -1;
+        if (!aIsMP4 && bIsMP4) return 1;
 
-          // Same type, sort by quality
-          const qualityA = extractQuality(a.type, a.url) || 0;
-          const qualityB = extractQuality(b.type, b.url) || 0;
-          return qualityB - qualityA;
-        },
-      );
+        // Same type, sort by quality
+        const qualityA = extractQuality(a.type, a.url) || 0;
+        const qualityB = extractQuality(b.type, b.url) || 0;
+        return qualityB - qualityA;
+      });
 
       // Check if we have any videos after deduplication
       // If all were filtered out, use the original sortedQualities as fallback

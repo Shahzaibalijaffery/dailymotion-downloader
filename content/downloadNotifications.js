@@ -5,148 +5,35 @@
 
 // Global state for notifications
 let notificationContainer = null;
-let activeDownloads = new Map(); // Map of downloadId -> { filename, interval, element, pollingFailures, recreationCount }
+let activeDownloads = new Map(); // downloadId -> { filename, interval, element, pollingFailures, recreationCount }
 
-/**
- * Create notification container if it doesn't exist
- * @returns {HTMLElement|null} Notification container element
- */
+function escapeHtml(s) {
+  if (s == null) return "";
+  const div = document.createElement("div");
+  div.textContent = String(s);
+  return div.innerHTML;
+}
+
+/** Create notification container if it doesn't exist. Styles in content/downloadNotifications.css */
 function createNotificationContainer() {
-  // Only create notifications in the top frame, not in iframes
-  if (window.self !== window.top) {
-    console.log("Skipping notification container creation in iframe");
-    return null;
-  }
+  if (window.self !== window.top) return null;
 
-  // Check if container already exists in DOM first
-  let existingContainer = document.getElementById(
-    "vimeo-downloader-notifications",
-  );
-  if (existingContainer) {
-    notificationContainer = existingContainer;
+  const existing = document.getElementById("vimeo-downloader-notifications");
+  if (existing) {
+    notificationContainer = existing;
     return notificationContainer;
   }
-
-  // Also check if we have a cached reference
   if (notificationContainer && document.body.contains(notificationContainer)) {
     return notificationContainer;
   }
-
-  // Make sure body exists
   if (!document.body) {
-    // Wait for body to be ready
     setTimeout(createNotificationContainer, 100);
     return null;
   }
 
   notificationContainer = document.createElement("div");
   notificationContainer.id = "vimeo-downloader-notifications";
-  notificationContainer.style.cssText = `
-    position: fixed;
-    bottom: 20px;
-    left: 20px;
-    z-index: 999999;
-    width: 400px;
-    max-width: 400px;
-    max-height: calc(100vh - 40px);
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-    pointer-events: none;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding-right: 8px;
-  `;
-
-  // Add responsive styles for mobile
-  if (
-    !document.getElementById("vimeo-downloader-notification-responsive-style")
-  ) {
-    const responsiveStyle = document.createElement("style");
-    responsiveStyle.id = "vimeo-downloader-notification-responsive-style";
-    responsiveStyle.textContent = `
-      @media (max-width: 600px) {
-        #vimeo-downloader-notifications {
-          width: calc(100vw - 40px) !important;
-          max-width: calc(100vw - 40px) !important;
-          left: 20px !important;
-          right: 20px !important;
-          bottom: 20px !important;
-        }
-        
-        #vimeo-downloader-notifications > div[id^="download-notification-"] {
-          width: 100% !important;
-          min-width: 0 !important;
-          max-width: 100% !important;
-          padding: 12px 16px !important;
-          font-size: 13px !important;
-        }
-      }
-    `;
-    document.head.appendChild(responsiveStyle);
-  }
-
-  // Add custom scrollbar styling
-  if (!document.getElementById("vimeo-downloader-scrollbar-style")) {
-    const scrollbarStyle = document.createElement("style");
-    scrollbarStyle.id = "vimeo-downloader-scrollbar-style";
-    scrollbarStyle.textContent = `
-      #vimeo-downloader-notifications::-webkit-scrollbar {
-        width: 6px;
-      }
-      #vimeo-downloader-notifications::-webkit-scrollbar-track {
-        background: transparent;
-      }
-      #vimeo-downloader-notifications::-webkit-scrollbar-thumb {
-        background: rgba(102, 126, 234, 0.5);
-        border-radius: 3px;
-      }
-      #vimeo-downloader-notifications::-webkit-scrollbar-thumb:hover {
-        background: rgba(102, 126, 234, 0.7);
-      }
-    `;
-    document.head.appendChild(scrollbarStyle);
-  }
-
-  // Add animation style if not already added
-  if (!document.getElementById("vimeo-downloader-notification-style")) {
-    const style = document.createElement("style");
-    style.id = "vimeo-downloader-notification-style";
-    style.textContent = `
-      @keyframes slideInUp {
-        from {
-          transform: translateY(100px);
-          opacity: 0;
-        }
-        to {
-          transform: translateY(0);
-          opacity: 1;
-        }
-      }
-      @keyframes slideOutDown {
-        from {
-          transform: translateY(0);
-          opacity: 1;
-        }
-        to {
-          transform: translateY(100px);
-          opacity: 0;
-        }
-      }
-    `;
-    document.head.appendChild(style);
-  }
-
   document.body.appendChild(notificationContainer);
-  console.log("Notification container created and appended to body");
-
-  // Verify it was actually added
-  const verify = document.getElementById("vimeo-downloader-notifications");
-  if (!verify) {
-    console.error("Notification container was not added to DOM!");
-    return null;
-  }
-
   return notificationContainer;
 }
 
@@ -167,38 +54,15 @@ function showDownloadNotification(
   qualityLabel = "",
   __dmDebugState = null,
 ) {
-  // Only show notifications in the top frame, not in iframes
-  if (window.self !== window.top) {
-    console.log("Skipping notification display in iframe");
-    return;
-  }
-
-  console.log("showDownloadNotification called:", {
-    downloadId,
-    filename,
-    status,
-    progress,
-  });
+  if (window.self !== window.top) return;
   try {
     if (__dmDebugState) {
-      __dmDebugState.lastShowNotification = {
-        downloadId,
-        filename,
-        status,
-        progress,
-        qualityLabel,
-        href: window.location.href,
-        ts: new Date().toISOString(),
-      };
+      __dmDebugState.lastShowNotification = { downloadId, filename, status, progress, qualityLabel, href: window.location.href, ts: new Date().toISOString() };
       __dmDebugState.lastShowNotificationError = null;
     }
-  } catch (e) {
-    // ignore
-  }
+  } catch (e) {}
 
-  // Ensure body exists
   if (!document.body) {
-    console.log("Document body not ready, waiting...");
     setTimeout(
       () =>
         showDownloadNotification(
@@ -217,7 +81,6 @@ function showDownloadNotification(
   const container = createNotificationContainer();
 
   if (!container) {
-    console.error("Could not create notification container");
     setTimeout(
       () =>
         showDownloadNotification(
@@ -233,190 +96,63 @@ function showDownloadNotification(
     return;
   }
 
-  // Create individual notification element for this download
   let notificationEl = document.getElementById(
     `download-notification-${downloadId}`,
   );
   if (!notificationEl) {
     notificationEl = document.createElement("div");
     notificationEl.id = `download-notification-${downloadId}`;
-    notificationEl.style.cssText = `
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      color: white;
-      padding: 16px 20px;
-      border-radius: 12px;
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
-      font-size: 14px;
-      line-height: 1.5;
-      animation: slideInUp 0.3s ease-out;
-      pointer-events: auto;
-      width: 400px;
-      min-width: 400px;
-      max-width: 400px;
-      box-sizing: border-box;
-    `;
-
-    // Apply responsive width on mobile (will be overridden by the style tag, but set initial value)
-    if (window.innerWidth <= 600) {
-      notificationEl.style.width = "100%";
-      notificationEl.style.minWidth = "0";
-      notificationEl.style.maxWidth = "100%";
-    }
+    notificationEl.className = "dm-notification-card dm-notif-anim-in";
     container.appendChild(notificationEl);
-    console.log("Created notification element for download:", downloadId);
   }
 
-  const progressBar =
+  const progressBarHtml =
     progress !== undefined
-      ? `
-    <div style="margin-top: 12px; background: rgba(255, 255, 255, 0.2); border-radius: 10px; height: 6px; overflow: hidden;">
-      <div style="background: white; height: 100%; width: ${progress}%; transition: width 0.3s ease; border-radius: 10px;"></div>
-    </div>
-    <div style="margin-top: 8px; font-size: 12px; opacity: 0.9;">${progress}%</div>
-  `
+      ? `<div class="dm-notification-progress-wrap"><div class="dm-notification-progress-fill" style="width:${progress}%"></div></div><div class="dm-notification-progress-pct">${progress}%</div>`
       : "";
-
-  // Show cancel button only if download is in progress (not complete or cancelled)
   const showCancelButton =
     progress !== undefined &&
     progress < 100 &&
     !status.includes("cancelled") &&
     !status.includes("complete");
-  const cancelButton = showCancelButton
-    ? `
-    <button id="cancel-btn-${downloadId}" style="
-      margin-top: 12px;
-      padding: 8px 16px;
-      background: rgba(255, 255, 255, 0.2);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      border-radius: 6px;
-      color: white;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s;
-      width: 100%;
-    " onmouseover="this.style.background='rgba(255, 255, 255, 0.3)'" onmouseout="this.style.background='rgba(255, 255, 255, 0.2)'">
-      ❌ Cancel Download
-    </button>
-  `
+  const cancelButtonHtml = showCancelButton
+    ? `<button type="button" id="cancel-btn-${downloadId}" class="dm-notification-btn">❌ Cancel Download</button>`
     : "";
-
-  // Extract just the quality part for display (e.g., "1080p" from "1080p (HLS)")
   const displayQuality = qualityLabel
-    ? qualityLabel.match(/(\d+p)/i)
-      ? qualityLabel.match(/(\d+p)/i)[1]
-      : qualityLabel.split(" ")[0]
+    ? (qualityLabel.match(/(\d+p)/i) && qualityLabel.match(/(\d+p)/i)[1]) ||
+      qualityLabel.split(" ")[0]
     : "";
-  const qualityDisplay = displayQuality
-    ? `<span style="opacity: 0.9; font-size: 12px; margin-left: 8px;">${displayQuality}</span>`
+  const qualityDisplayHtml = displayQuality
+    ? `<span class="dm-notification-quality">${escapeHtml(displayQuality)}</span>`
     : "";
 
   notificationEl.innerHTML = `
-    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
-      <div style="font-size: 20px;">⬇️</div>
-      <div style="flex: 1;">
-        <div style="font-weight: 600; margin-bottom: 4px;">Download Started${qualityDisplay}</div>
-        <div style="font-size: 12px; opacity: 0.9; word-break: break-word;">${filename}</div>
+    <div class="dm-notification-header">
+      <span class="dm-notification-icon">⬇️</span>
+      <div class="dm-notification-body">
+        <div class="dm-notification-title">Download Started${qualityDisplayHtml}</div>
+        <div class="dm-notification-filename">${escapeHtml(filename)}</div>
       </div>
     </div>
-    <div style="font-size: 13px; opacity: 0.95; margin-top: 8px;">${status}</div>
-    ${progressBar}
-    ${cancelButton}
+    <div class="dm-notification-status">${escapeHtml(status)}</div>
+    ${progressBarHtml}
+    ${cancelButtonHtml}
   `;
 
-  // Add cancel button event listener if button exists
-  // Use event delegation on the notification element to handle dynamically created buttons
   if (showCancelButton) {
-    // Remove any existing listeners by cloning the element
     const cancelBtn = notificationEl.querySelector(`#cancel-btn-${downloadId}`);
     if (cancelBtn) {
-      // Remove old listener by cloning
       const newCancelBtn = cancelBtn.cloneNode(true);
       cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
-
       newCancelBtn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        console.log(
-          "🚫 [CONTENT] Cancel button clicked for download:",
-          downloadId,
-        );
-        console.log(
-          "🚫 [CONTENT] Extension context valid:",
-          isExtensionContextValid(),
-        );
-
-        // Stop polling immediately
         stopDownloadProgressPolling(downloadId);
-
-        // Hide notification immediately
         hideDownloadNotification(downloadId);
-
-        // Send cancel request to background (fire and forget)
-        console.log(
-          "🚫 [CONTENT] Sending cancelDownload message with downloadId:",
-          downloadId,
-        );
-        safeSendMessage(
-          {
-            action: "cancelDownload",
-            downloadId: downloadId,
-          },
-          (response) => {
-            console.log(
-              "🚫 [CONTENT] Received response from cancelDownload:",
-              response,
-            );
-            if (response && response.success) {
-              console.log("🚫 [CONTENT] ✅ Download cancellation confirmed");
-            } else {
-              console.warn(
-                "🚫 [CONTENT] ⚠️ Download cancellation may have failed:",
-                response,
-              );
-            }
-          },
-        );
+        safeSendMessage({ action: "cancelDownload", downloadId }, () => {});
       });
-    } else {
-      console.warn("Cancel button not found for download:", downloadId);
     }
   }
-
-  notificationEl.style.display = "block";
-  notificationEl.style.visibility = "visible";
-  notificationEl.style.opacity = "1";
-
-  // Force visibility
-  if (container) {
-    container.style.display = "flex";
-    container.style.visibility = "visible";
-  }
-
-  console.log("Notification displayed successfully:", downloadId, filename);
-  console.log("Notification element:", notificationEl);
-  console.log("Notification container:", container);
-
-  // Verify it's actually visible
-  setTimeout(() => {
-    const checkEl = document.getElementById(
-      `download-notification-${downloadId}`,
-    );
-    if (checkEl) {
-      const rect = checkEl.getBoundingClientRect();
-      console.log("Notification position:", {
-        top: rect.top,
-        left: rect.left,
-        width: rect.width,
-        height: rect.height,
-        visible: rect.width > 0 && rect.height > 0,
-      });
-    } else {
-      console.error("Notification element not found in DOM after creation!");
-    }
-  }, 100);
 }
 
 /**
@@ -426,7 +162,6 @@ function showDownloadNotification(
  */
 function showDownloadBlockedToast(message, reason = "maxConcurrent") {
   if (window.self !== window.top) return;
-
   const container = createNotificationContainer();
   if (!container) return;
 
@@ -435,44 +170,28 @@ function showDownloadBlockedToast(message, reason = "maxConcurrent") {
   if (!el) {
     el = document.createElement("div");
     el.id = id;
-    el.style.cssText = `
-      background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
-      color: white;
-      padding: 16px 20px;
-      border-radius: 12px;
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-      font-size: 14px;
-      line-height: 1.5;
-      animation: slideInUp 0.3s ease-out;
-      pointer-events: auto;
-      width: 400px;
-      max-width: calc(100vw - 40px);
-      box-sizing: border-box;
-    `;
+    el.className = "dm-notification-toast";
     container.appendChild(el);
   }
 
-  const title =
-    reason === "largeFile"
-      ? "Large file downloading"
-      : "Download limit reached";
+  const title = reason === "largeFile" ? "Large file downloading" : "Download limit reached";
   el.innerHTML = `
-    <div style="display: flex; align-items: flex-start; gap: 12px;">
-      <span style="font-size: 20px;">⏳</span>
-      <div>
-        <div style="font-weight: 600; margin-bottom: 6px;">${title}</div>
-        <div style="font-size: 13px; opacity: 0.95;">${message}</div>
+    <div class="dm-notification-header">
+      <span class="dm-notification-icon">⏳</span>
+      <div class="dm-notification-body">
+        <div class="dm-notification-title">${escapeHtml(title)}</div>
+        <div class="dm-notification-status">${escapeHtml(message)}</div>
       </div>
     </div>
   `;
   el.style.display = "block";
-  el.style.animation = "none";
+  el.classList.remove("dm-notif-anim-out");
   el.offsetHeight;
-  el.style.animation = "slideInUp 0.3s ease-out";
+  el.classList.add("dm-notif-anim-in");
 
   const hide = () => {
-    el.style.animation = "slideOutDown 0.3s ease-out forwards";
+    el.classList.remove("dm-notif-anim-in");
+    el.classList.add("dm-notif-anim-out");
     setTimeout(() => {
       el.style.display = "none";
     }, 300);
@@ -488,202 +207,75 @@ function showDownloadBlockedToast(message, reason = "maxConcurrent") {
  * @param {number|undefined} progress - Progress percentage
  */
 function updateDownloadNotification(downloadId, filename, status, progress) {
-  // Only update notifications in the top frame, not in iframes
-  if (window.self !== window.top) {
-    console.log("Skipping notification update in iframe");
-    return;
-  }
-
-  // Ensure container exists
+  if (window.self !== window.top) return;
   const container = createNotificationContainer();
-  if (!container) {
-    console.error("Could not get/create notification container for update");
-    return;
-  }
+  if (!container) return;
 
-  const notificationEl = document.getElementById(
-    `download-notification-${downloadId}`,
-  );
+  const notificationEl = document.getElementById(`download-notification-${downloadId}`);
   if (!notificationEl) {
-    console.warn("Notification element not found, recreating:", downloadId);
-    // Try to get qualityLabel from stored download info
-    safeSendMessage(
-      { action: "getDownloadInfo", downloadId: downloadId },
-      (response) => {
-        const qualityLabel = response?.info?.qualityLabel || "";
-        showDownloadNotification(
-          downloadId,
-          filename,
-          status,
-          progress,
-          qualityLabel,
-        );
-      },
-    );
+    safeSendMessage({ action: "getDownloadInfo", downloadId }, (response) => {
+      showDownloadNotification(downloadId, filename, status, progress, response?.info?.qualityLabel || "");
+    });
     return;
   }
 
-  const progressBar =
+  const progressBarHtml =
     progress !== undefined
-      ? `
-    <div style="margin-top: 12px; background: rgba(255, 255, 255, 0.2); border-radius: 10px; height: 6px; overflow: hidden;">
-      <div style="background: white; height: 100%; width: ${progress}%; transition: width 0.3s ease; border-radius: 10px;"></div>
-    </div>
-    <div style="margin-top: 8px; font-size: 12px; opacity: 0.9;">${progress}%</div>
-  `
+      ? `<div class="dm-notification-progress-wrap"><div class="dm-notification-progress-fill" style="width:${progress}%"></div></div><div class="dm-notification-progress-pct">${progress}%</div>`
       : "";
-
   const isCancelled = status && status.toLowerCase().includes("cancelled");
-  const isFailed =
-    status &&
-    (status.toLowerCase().includes("failed") ||
-      status.toLowerCase().includes("error"));
-  const statusIcon = isCancelled
-    ? "❌"
-    : isFailed
-      ? "⚠️"
-      : progress === 100
-        ? "✅"
-        : "⬇️";
-  const statusText = isCancelled
-    ? "Download Cancelled"
-    : isFailed
-      ? "Download Failed"
-      : progress === 100
-        ? "Download Complete"
-        : "Downloading";
-
-  // Show cancel button only if download is in progress (not complete, cancelled, or failed)
+  const isFailed = status && (status.toLowerCase().includes("failed") || status.toLowerCase().includes("error"));
+  const statusIcon = isCancelled ? "❌" : isFailed ? "⚠️" : progress === 100 ? "✅" : "⬇️";
+  const statusText = isCancelled ? "Download Cancelled" : isFailed ? "Download Failed" : progress === 100 ? "Download Complete" : "Downloading";
   const showCancelButton =
-    progress !== undefined &&
-    progress < 100 &&
-    !isCancelled &&
-    !isFailed &&
-    !status.includes("complete");
-  // Show dismiss button for failed or cancelled downloads
+    progress !== undefined && progress < 100 && !isCancelled && !isFailed && !status.includes("complete");
   const showDismissButton = isFailed || isCancelled;
-
-  const cancelButton = showCancelButton
-    ? `
-    <button id="cancel-btn-${downloadId}" style="
-      margin-top: 12px;
-      padding: 8px 16px;
-      background: rgba(255, 255, 255, 0.2);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      border-radius: 6px;
-      color: white;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s;
-      width: 100%;
-    " onmouseover="this.style.background='rgba(255, 255, 255, 0.3)'" onmouseout="this.style.background='rgba(255, 255, 255, 0.2)'">
-      ❌ Cancel Download
-    </button>
-  `
+  const cancelButtonHtml = showCancelButton
+    ? `<button type="button" id="cancel-btn-${downloadId}" class="dm-notification-btn">❌ Cancel Download</button>`
     : "";
-
-  const dismissButton = showDismissButton
-    ? `
-    <button id="dismiss-btn-${downloadId}" style="
-      margin-top: 12px;
-      padding: 8px 16px;
-      background: rgba(255, 255, 255, 0.2);
-      border: 1px solid rgba(255, 255, 255, 0.3);
-      border-radius: 6px;
-      color: white;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s;
-      width: 100%;
-    " onmouseover="this.style.background='rgba(255, 255, 255, 0.3)'" onmouseout="this.style.background='rgba(255, 255, 255, 0.2)'">
-      ✕ Dismiss
-    </button>
-  `
+  const dismissButtonHtml = showDismissButton
+    ? `<button type="button" id="dismiss-btn-${downloadId}" class="dm-notification-btn">✕ Dismiss</button>`
     : "";
 
   notificationEl.innerHTML = `
-    <div style="display: flex; align-items: center; gap: 12px; margin-bottom: 8px;">
-      <div style="font-size: 20px;">${statusIcon}</div>
-      <div style="flex: 1;">
-        <div style="font-weight: 600; margin-bottom: 4px;">${statusText}</div>
-        <div style="font-size: 12px; opacity: 0.9; word-break: break-word;">${filename}</div>
+    <div class="dm-notification-header">
+      <span class="dm-notification-icon">${statusIcon}</span>
+      <div class="dm-notification-body">
+        <div class="dm-notification-title">${escapeHtml(statusText)}</div>
+        <div class="dm-notification-filename">${escapeHtml(filename)}</div>
       </div>
     </div>
-    <div style="font-size: 13px; opacity: 0.95; margin-top: 8px;">${status}</div>
-    ${progressBar}
-    ${cancelButton}
-    ${dismissButton}
+    <div class="dm-notification-status">${escapeHtml(status)}</div>
+    ${progressBarHtml}
+    ${cancelButtonHtml}
+    ${dismissButtonHtml}
   `;
 
-  // Add cancel button event listener if button exists
   if (showCancelButton) {
     const cancelBtn = notificationEl.querySelector(`#cancel-btn-${downloadId}`);
     if (cancelBtn) {
-      // Remove existing listener by cloning
-      const newCancelBtn = cancelBtn.cloneNode(true);
-      cancelBtn.parentNode.replaceChild(newCancelBtn, cancelBtn);
-
-      newCancelBtn.addEventListener("click", (e) => {
+      const newBtn = cancelBtn.cloneNode(true);
+      cancelBtn.parentNode.replaceChild(newBtn, cancelBtn);
+      newBtn.addEventListener("click", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        console.log("Cancel button clicked for download:", downloadId);
-        // Check current status first
         safeStorageGet([`downloadStatus_${downloadId}`], (result) => {
-          const currentStatus = result[`downloadStatus_${downloadId}`] || "";
-          const isFailedOrCancelled =
-            currentStatus.toLowerCase().includes("failed") ||
-            currentStatus.toLowerCase().includes("error") ||
-            currentStatus.toLowerCase().includes("cancelled");
-
-          if (isFailedOrCancelled) {
-            // Download already failed/cancelled, just hide the notification
+          const s = (result && result[`downloadStatus_${downloadId}`]) || "";
+          if (/failed|error|cancelled/i.test(s)) {
             hideDownloadNotification(downloadId);
             return;
           }
-
-          // Stop polling immediately
           stopDownloadProgressPolling(downloadId);
-
-          // Hide notification immediately
           hideDownloadNotification(downloadId);
-
-          // Try to cancel the download (fire and forget)
-          safeSendMessage(
-            {
-              action: "cancelDownload",
-              downloadId: downloadId,
-            },
-            (response) => {
-              if (response && response.success) {
-                console.log("Download cancellation confirmed");
-              } else {
-                console.warn(
-                  "Download cancellation may have failed:",
-                  response,
-                );
-              }
-            },
-          );
+          safeSendMessage({ action: "cancelDownload", downloadId }, () => {});
         });
       });
-    } else {
-      console.warn(
-        "Cancel button not found in updateNotification for download:",
-        downloadId,
-      );
     }
   }
-
-  // Add dismiss button event listener if button exists
   if (showDismissButton) {
-    const dismissBtn = document.getElementById(`dismiss-btn-${downloadId}`);
+    const dismissBtn = notificationEl.querySelector(`#dismiss-btn-${downloadId}`);
     if (dismissBtn) {
-      dismissBtn.addEventListener("click", () => {
-        console.log("Dismiss button clicked for download:", downloadId);
-        hideDownloadNotification(downloadId);
-      });
+      dismissBtn.addEventListener("click", () => hideDownloadNotification(downloadId));
     }
   }
 }
@@ -693,18 +285,13 @@ function updateDownloadNotification(downloadId, filename, status, progress) {
  * @param {string} downloadId - Download ID
  */
 function hideDownloadNotification(downloadId) {
-  const notificationEl = document.getElementById(
-    `download-notification-${downloadId}`,
-  );
-  if (notificationEl) {
-    notificationEl.style.animation = "slideOutDown 0.3s ease-out";
-    setTimeout(() => {
-      if (notificationEl && notificationEl.parentNode) {
-        notificationEl.parentNode.removeChild(notificationEl);
-      }
-      activeDownloads.delete(downloadId);
-    }, 300);
-  }
+  const notificationEl = document.getElementById(`download-notification-${downloadId}`);
+  if (!notificationEl) return;
+  notificationEl.classList.add("dm-notif-exit");
+  setTimeout(() => {
+    if (notificationEl.parentNode) notificationEl.parentNode.removeChild(notificationEl);
+    activeDownloads.delete(downloadId);
+  }, 300);
 }
 
 /**

@@ -6,6 +6,8 @@ const archiver = require("archiver");
 const filesToInclude = [
   "manifest.json",
   "background/background.js",
+  "background/state.js",
+  "background/videoData.js",
   "background/cancelDownload.js",
   "background/startDownload.js",
   "background/downloadBlob.js",
@@ -16,10 +18,8 @@ const filesToInclude = [
   "ffmpeg-helper-umd.cjs",
   "ffmpeg-helper-umd.js",
   "content/utils.js",
-  "content/videoExtraction.js",
   "content/restoreDownloads.js",
   "content/downloadNotifications.js",
-  "content/pageTracking.js",
   "content/downloadButton.js",
   "content/content.js",
   "popup/popup.html",
@@ -62,9 +62,7 @@ function createBundle(target = "chrome") {
     archive.on("error", reject);
     archive.pipe(output);
 
-    console.log(
-      `📦 Creating ${isFirefox ? "Firefox" : "Chrome"} bundle...`,
-    );
+    console.log(`📦 Creating ${isFirefox ? "Firefox" : "Chrome"} bundle...`);
 
     // Manifest: Chrome uses dist/manifest.json, Firefox uses manifest.firefox.json
     const manifestSource = isFirefox
@@ -114,7 +112,9 @@ async function run() {
   console.log("🚀 Starting extension bundling...\n");
   await createBundle("chrome");
   await createBundle("firefox");
-  console.log("\n✅ Done. Load dailymotion-downloader-firefox.zip in Firefox (Load Temporary Add-on → select zip).");
+  console.log(
+    "\n✅ Done. Load dailymotion-downloader-firefox.zip in Firefox (Load Temporary Add-on → select zip).",
+  );
 }
 
 run().catch((err) => {
