@@ -31,8 +31,7 @@
       "background/videoData.js",
       "background/cancelDownload.js",
       "background/startDownload.js",
-      "background/downloadBlob.js",
-      "background/downloadM3U8.js",
+      "background/m3u8Parser.js",
       "background/configParser.js",
       "background/background.js"
     ]
@@ -40,6 +39,10 @@
   "content_scripts": [
     {
       "matches": ["*://*.dailymotion.com/*"],
+      "css": [
+        "content/downloadButton.css",
+        "content/downloadNotifications.css"
+      ],
       "js": [
         "scripts/utils.js",
         "scripts/storage.js",
@@ -48,6 +51,7 @@
         "content/restoreDownloads.js",
         "content/downloadNotifications.js",
         "content/downloadButton.js",
+        "js/m3u8-downloader.umd.js",
         "content/content.js"
       ],
       "run_at": "document_end",
@@ -69,7 +73,7 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["assets/feed-download-icon.png"],
+      "resources": ["assets/feed-download-icon.png", "js/webpage-ffmpeg.js", "js/ffmpeg-helper-umd.js"],
       "matches": ["*://*.dailymotion.com/*"]
     }
   ],

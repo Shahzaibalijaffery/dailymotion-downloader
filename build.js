@@ -15,7 +15,6 @@ const jsFiles = [
   { src: "background/background.js", dest: "background/background.js" },
   { src: "content/content.js", dest: "content/content.js" },
   { src: "popup/popup.js", dest: "popup/popup.js" },
-  { src: "background/offscreen.js", dest: "background/offscreen.js" },
 ];
 
 // Files to copy as-is - maintain directory structure in dist/
@@ -23,9 +22,8 @@ const copyFiles = [
   { src: "manifest.json", dest: "manifest.json" },
   { src: "popup/popup.html", dest: "popup/popup.html" },
   { src: "popup/popup.css", dest: "popup/popup.css" },
-  { src: "background/offscreen.html", dest: "background/offscreen.html" },
-  { src: "ffmpeg-helper-umd.cjs", dest: "ffmpeg-helper-umd.cjs" },
-  { src: "ffmpeg-helper-umd.cjs", dest: "ffmpeg-helper-umd.js" }, // .js copy for Firefox dynamic script load (some envs block .cjs)
+  { src: "js/ffmpeg-helper-umd.cjs", dest: "js/ffmpeg-helper-umd.cjs" },
+  { src: "js/ffmpeg-helper-umd.cjs", dest: "js/ffmpeg-helper-umd.js" }, // .js copy for Firefox dynamic script load (some envs block .cjs)
   { src: "icons/icon16.png", dest: "icons/icon16.png" },
   { src: "icons/icon48.png", dest: "icons/icon48.png" },
   { src: "icons/icon128.png", dest: "icons/icon128.png" },
@@ -33,6 +31,8 @@ const copyFiles = [
     src: "assets/feed-download-icon.png",
     dest: "assets/feed-download-icon.png",
   },
+  { src: "js/m3u8-downloader.umd.js", dest: "js/m3u8-downloader.umd.js" },
+  { src: "js/webpage-ffmpeg.js", dest: "js/webpage-ffmpeg.js" },
 ];
 
 async function minifyFile(inputPath, outputPath) {
@@ -102,6 +102,13 @@ function copyFile(inputPath, outputPath) {
 
 async function build() {
   console.log("🔨 Building extension...\n");
+
+  // Ensure js/ffmpeg-helper-umd.js exists in source (for Load unpacked from project root)
+  const cjsPath = path.join(__dirname, "js", "ffmpeg-helper-umd.cjs");
+  const jsPath = path.join(__dirname, "js", "ffmpeg-helper-umd.js");
+  if (fs.existsSync(cjsPath)) {
+    fs.copyFileSync(cjsPath, jsPath);
+  }
 
   // Create output directory
   if (!fs.existsSync(config.outputDir)) {
@@ -180,13 +187,15 @@ async function build() {
     if (!fs.existsSync(distContentDir)) {
       fs.mkdirSync(distContentDir, { recursive: true });
     }
-    // Files needed by manifest.json content_scripts
+    // Files needed by manifest.json content_scripts (js + css)
     const contentFiles = [
       "utils.js",
       "restoreDownloads.js",
       "downloadNotifications.js",
       "downloadButton.js",
       "content.js",
+      "downloadButton.css",
+      "downloadNotifications.css",
     ];
     contentFiles.forEach((file) => {
       const srcPath = path.join(contentDir, file);
@@ -218,12 +227,9 @@ async function build() {
       "videoData.js",
       "cancelDownload.js",
       "startDownload.js",
-      "downloadBlob.js",
-      "downloadM3U8.js",
+      "m3u8Parser.js",
       "configParser.js",
       "background.js",
-      "offscreen.js",
-      "offscreen.html",
     ];
     backgroundFiles.forEach((file) => {
       const srcPath = path.join(backgroundDir, file);
