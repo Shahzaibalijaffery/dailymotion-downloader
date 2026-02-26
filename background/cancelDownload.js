@@ -48,14 +48,7 @@ async function cancelDownload(
     const tabId = info?.tabId;
     downloadInfo.delete(downloadId);
 
-    // Remove from concurrent-download count so user can start another
-    const storage = await chrome.storage.local.get(["activeDownloadIds"]);
-    const activeIds = (storage.activeDownloadIds || []).filter(
-      (id) => id !== downloadId,
-    );
-    await chrome.storage.local.set({ activeDownloadIds: activeIds });
-
-    // Remove progress and downloadInfo immediately
+    // Remove progress and downloadInfo from storage (cleanup)
     // Keep cancellation flag and status temporarily so download process can detect cancellation
     await chrome.storage.local.remove([
       `downloadProgress_${downloadId}`,

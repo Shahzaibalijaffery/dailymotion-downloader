@@ -16,7 +16,6 @@ const CONTENT_SCRIPT_FILES = [
   "scripts/storage.js",
   "scripts/messaging.js",
   "content/utils.js",
-  "content/restoreDownloads.js",
   "content/downloadNotifications.js",
   "content/downloadButton.js",
   "content/content.js",

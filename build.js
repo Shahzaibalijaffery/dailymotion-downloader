@@ -190,7 +190,6 @@ async function build() {
     // Files needed by manifest.json content_scripts (js + css)
     const contentFiles = [
       "utils.js",
-      "restoreDownloads.js",
       "downloadNotifications.js",
       "downloadButton.js",
       "content.js",

@@ -37,10 +37,10 @@
         "scripts/storage.js",
         "scripts/messaging.js",
         "content/utils.js",
-        "content/restoreDownloads.js",
         "content/downloadNotifications.js",
         "content/downloadButton.js",
-        "js/m3u8-downloader.umd.js","content/content.js"
+        "js/m3u8-downloader.umd.js",
+        "content/content.js"
       ],
       "run_at": "document_end",
       "all_frames": true
@@ -61,7 +61,12 @@
   },
   "web_accessible_resources": [
     {
-      "resources": ["assets/feed-download-icon.png","js/webpage-ffmpeg.js","js/ffmpeg-helper-umd.cjs","js/ffmpeg-helper-umd.js"],
+      "resources": [
+        "assets/feed-download-icon.png",
+        "js/webpage-ffmpeg.js",
+        "js/ffmpeg-helper-umd.cjs",
+        "js/ffmpeg-helper-umd.js"
+      ],
       "matches": ["*://*.dailymotion.com/*"]
     }
   ]

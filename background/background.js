@@ -204,34 +204,8 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
     })();
     return true;
   } else if (request.action === "getDownloadInfo") {
-    // Return download info for a specific download ID
-    // First check in-memory Map, then try storage (for persistence across service worker restarts)
-    let info = downloadInfo.get(request.downloadId);
-
-    if (!info) {
-      // Try to restore from storage
-      chrome.storage.local.get(
-        [`downloadInfo_${request.downloadId}`],
-        (items) => {
-          if (items[`downloadInfo_${request.downloadId}`]) {
-            try {
-              info = JSON.parse(items[`downloadInfo_${request.downloadId}`]);
-              // Restore to in-memory Map for future use
-              downloadInfo.set(request.downloadId, info);
-              sendResponse({ info: info });
-            } catch (e) {
-              console.warn("Failed to parse stored download info:", e);
-              sendResponse({ info: null });
-            }
-          } else {
-            sendResponse({ info: null });
-          }
-        },
-      );
-      return true; // Keep channel open for async response
-    }
-
-    sendResponse({ info: info || null });
+    const info = downloadInfo.get(request.downloadId) || null;
+    sendResponse({ info });
   } else if (request.action === "download") {
     return handleDownloadAction(
       request,
@@ -352,56 +326,3 @@ function updateBadge(tabId) {
     console.warn("Failed to set badge:", e);
   }
 }
-
-async function restoreDownloadInfoFromStorage() {
-  try {
-    const items = await new Promise((resolve) => {
-      chrome.storage.local.get(null, (result) => {
-        resolve(result || {});
-      });
-    });
-
-    // Find all download progress keys
-    const downloadKeys = Object.keys(items).filter((key) =>
-      key.startsWith("downloadProgress_"),
-    );
-
-    for (const key of downloadKeys) {
-      const downloadId = key.replace("downloadProgress_", "");
-      const progress = items[key];
-      const status = items[`downloadStatus_${downloadId}`];
-      const isCancelled = items[`downloadCancelled_${downloadId}`];
-
-      // Don't restore if cancelled
-      if (isCancelled) {
-        continue;
-      }
-
-      // Only restore if download is in progress
-      if (
-        progress !== undefined &&
-        progress < 100 &&
-        status &&
-        !status.toLowerCase().includes("complete") &&
-        !status.toLowerCase().includes("failed") &&
-        !status.toLowerCase().includes("error") &&
-        !status.toLowerCase().includes("cancelled")
-      ) {
-        // Try to get download info from storage (if we stored it)
-        const storedInfo = items[`downloadInfo_${downloadId}`];
-        if (storedInfo) {
-          try {
-            const info = JSON.parse(storedInfo);
-            downloadInfo.set(downloadId, info);
-          } catch (e) {
-            console.warn("Failed to parse stored download info:", e);
-          }
-        }
-      }
-    }
-  } catch (error) {
-    console.warn("Error restoring download info from storage:", error);
-  }
-}
-
-restoreDownloadInfoFromStorage();

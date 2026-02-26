@@ -84,15 +84,7 @@ try {
     window.__dmDownloaderDebug = {
       state: __dmDebugState,
       forceRestore: () => {
-        originalConsoleLog("[DM Downloader] forceRestore() called");
-        try {
-          if (typeof restoreActiveDownloads === "function") {
-            restoreActiveDownloads();
-          }
-        } catch (e) {
-          __dmDebugState.lastRestoreError = e?.message || String(e);
-          originalConsoleError("[DM Downloader] forceRestore error", e);
-        }
+        originalConsoleLog("[DM Downloader] Restore disabled (downloads run in main world; no restore on refresh).");
       },
       dumpStorageKeys: () =>
         new Promise((resolve) => {

@@ -2,7 +2,6 @@ const MAX_CONCURRENT_DOWNLOADS = 3;
 const MAX_SEGMENTS_FOR_CONCURRENT = 500;
 
 const DOWNLOAD_STORAGE_KEYS = (id) => [
-  `downloadInfo_${id}`,
   `downloadCancelled_${id}`,
   `downloadStatus_${id}`,
   `downloadProgress_${id}`,
@@ -93,136 +92,53 @@ function handleDownloadAction(
 
   if (activeDownloads.has(normalizedUrl)) {
     const existingDownloadId = activeDownloads.get(normalizedUrl);
-    chrome.storage.local.get(
-      [`downloadProgress_${existingDownloadId}`, `downloadStatus_${existingDownloadId}`],
-      (storageResult) => {
-        const progress = storageResult[`downloadProgress_${existingDownloadId}`];
-        const status = (storageResult[`downloadStatus_${existingDownloadId}`] || "").toLowerCase();
-        const finished =
-          progress === undefined ||
-          progress === 100 ||
-          /complete|cancelled|failed/.test(status);
-
-        if (finished) {
-          activeDownloads.delete(normalizedUrl);
-          downloadInfo.delete(existingDownloadId);
-          downloadControllers.delete(existingDownloadId);
-          proceedWithDownload();
-          return;
-        }
-
-        const controller = downloadControllers.get(existingDownloadId);
-        const info = downloadInfo.get(existingDownloadId);
-        if (!controller?.controller?.signal?.aborted && !info) {
-          activeDownloads.delete(normalizedUrl);
-          if (controller) downloadControllers.delete(existingDownloadId);
-          proceedWithDownload();
-          return;
-        }
-
-        notifyTab(request.tabId || sender?.tab?.id, {
-          action: "downloadStarted",
-          downloadId: existingDownloadId,
-          filename: info?.filename || request.filename,
-          qualityLabel: info?.qualityLabel || request.qualityLabel || "",
-          isExisting: true,
-        });
-        sendResponse({
-          success: false,
-          error: "This file is already being downloaded. Please wait for the current download to complete.",
-          downloadId: existingDownloadId,
-          isExisting: true,
-        });
-      },
-    );
+    const controller = downloadControllers.get(existingDownloadId);
+    const info = downloadInfo.get(existingDownloadId);
+    if (controller?.controller?.signal?.aborted || !info) {
+      activeDownloads.delete(normalizedUrl);
+      if (controller) downloadControllers.delete(existingDownloadId);
+      downloadInfo.delete(existingDownloadId);
+      proceedWithDownload();
+      return true;
+    }
+    notifyTab(request.tabId || sender?.tab?.id, {
+      action: "downloadStarted",
+      downloadId: existingDownloadId,
+      filename: info?.filename || request.filename,
+      qualityLabel: info?.qualityLabel || request.qualityLabel || "",
+      isExisting: true,
+    });
+    sendResponse({
+      success: false,
+      error: "This file is already being downloaded. Please wait for the current download to complete.",
+      downloadId: existingDownloadId,
+      isExisting: true,
+    });
     return true;
   }
 
   proceedWithDownload();
 
   function proceedWithDownload() {
-    chrome.storage.local.get(["activeDownloadIds"], (storageResult) => {
-      const activeIds = storageResult.activeDownloadIds || [];
-      if (activeIds.length === 0) {
-        proceedWithCountCheck([], []);
-        return;
-      }
-      const keys = activeIds.flatMap((id) => [
-        `downloadProgress_${id}`,
-        `downloadStatus_${id}`,
-        `downloadSegments_${id}`,
-      ]);
-      chrome.storage.local.get(keys, (progressResult) => {
-        const pr = progressResult || {};
-        const stillActive = activeIds.filter((id) => {
-          const progress = pr[`downloadProgress_${id}`];
-          const status = (pr[`downloadStatus_${id}`] || "").toLowerCase();
-          if (progress === undefined || progress === 100) return false;
-          if (/complete|cancelled|failed/.test(status)) return false;
-          return true;
-        });
-        const segmentCounts = stillActive.map((id) => ({
-          id,
-          segments: parseInt(pr[`downloadSegments_${id}`], 10) || 0,
-        }));
-        proceedWithCountCheck(stillActive, segmentCounts);
-      });
-    });
-  }
-
-  function notifyBlocked(message, reason) {
-    notifyTab(request.tabId || sender?.tab?.id, {
-      action: "showDownloadBlockedNotification",
-      message,
-      reason,
-    });
-  }
-
-  function proceedWithCountCheck(stillActive, segmentCounts) {
-    const hasLarge = segmentCounts?.some((s) => s.segments > MAX_SEGMENTS_FOR_CONCURRENT);
-    if (hasLarge) {
+    if (activeDownloads.size >= MAX_CONCURRENT_DOWNLOADS) {
       sendResponse({
         success: false,
-        error: "A large file is currently downloading (over 500 segments). Please wait for it to complete.",
+        error: `Maximum ${MAX_CONCURRENT_DOWNLOADS} downloads at a time. Please wait for one to complete.`,
       });
-      notifyBlocked("Large file downloading...", "largeFile");
-      return;
-    }
-    if (stillActive.length >= MAX_CONCURRENT_DOWNLOADS) {
-      chrome.storage.local.set({ activeDownloadIds: stillActive }, () => {
-        sendResponse({
-          success: false,
-          error: `Maximum ${MAX_CONCURRENT_DOWNLOADS} downloads at a time. Please wait for one to complete.`,
-        });
-        notifyBlocked("Too many downloads", "maxConcurrent");
+      notifyTab(request.tabId || sender?.tab?.id, {
+        action: "showDownloadBlockedNotification",
+        message: "Too many downloads",
+        reason: "maxConcurrent",
       });
       return;
     }
-
     const downloadId = generateDownloadId();
-    chrome.storage.local.set(
-      { activeDownloadIds: [...stillActive, downloadId] },
-      () => {
-        if (chrome.runtime.lastError) {
-          sendResponse({ success: false, error: "Failed to register download. Please try again." });
-          return;
-        }
-        runDownload(downloadId);
-      },
-    );
-  }
-
-  function removeFromActiveIds(id) {
-    chrome.storage.local.get(["activeDownloadIds"], (r) => {
-      const ids = (r.activeDownloadIds || []).filter((x) => x !== id);
-      chrome.storage.local.set({ activeDownloadIds: ids });
-    });
+    runDownload(downloadId);
   }
 
   function clearStorageAfterDelay(downloadId, delayMs) {
     setTimeout(() => {
       downloadInfo.delete(downloadId);
-      removeFromActiveIds(downloadId);
       chrome.storage.local.remove(DOWNLOAD_STORAGE_KEYS(downloadId));
     }, delayMs);
   }
@@ -245,7 +161,6 @@ function handleDownloadAction(
     };
     activeDownloads.set(normalizedUrl, downloadId);
     downloadInfo.set(downloadId, info);
-    chrome.storage.local.set({ [`downloadInfo_${downloadId}`]: JSON.stringify(info) });
 
     notifyTab(tabId, {
       action: "downloadStarted",
@@ -266,7 +181,6 @@ function handleDownloadAction(
     )
       .then(() => {
         activeDownloads.delete(normalizedUrl);
-        removeFromActiveIds(downloadId);
         const completedInfo = downloadInfo.get(downloadId);
         if (completedInfo?.tabId) {
           chrome.tabs.get(completedInfo.tabId, (tab) => {
@@ -288,7 +202,6 @@ function handleDownloadAction(
       })
       .catch((err) => {
         activeDownloads.delete(normalizedUrl);
-        removeFromActiveIds(downloadId);
         const isCancelled = err.message?.includes("cancelled");
         clearStorageAfterDelay(downloadId, isCancelled ? 2000 : 15000);
         sendResponse({ success: false, error: err.message });

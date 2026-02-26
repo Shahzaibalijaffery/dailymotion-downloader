@@ -17,7 +17,6 @@ const filesToInclude = [
   "js/m3u8-downloader.umd.js",
   "js/webpage-ffmpeg.js",
   "content/utils.js",
-  "content/restoreDownloads.js",
   "content/downloadNotifications.js",
   "content/downloadButton.js",
   "content/content.js",

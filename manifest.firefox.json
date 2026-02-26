@@ -48,7 +48,6 @@
         "scripts/storage.js",
         "scripts/messaging.js",
         "content/utils.js",
-        "content/restoreDownloads.js",
         "content/downloadNotifications.js",
         "content/downloadButton.js",
         "js/m3u8-downloader.umd.js",
